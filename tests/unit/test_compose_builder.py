@@ -187,6 +187,7 @@ class TestAddNodeServiceValidator:
             "./vnode1/config:/opt/ripple/config",
             "./vnode1/log:/opt/ripple/log",
             "./vnode1/lib:/opt/ripple/lib",
+            "./vnode1/db:/var/lib/xrpld/db",
         ]
         assert svc["volumes"] == expected_volumes
 
@@ -245,6 +246,7 @@ class TestAddNodeServicePeer:
             "./pnode1/config:/opt/ripple/config",
             "./pnode1/log:/opt/ripple/log",
             "./pnode1/lib:/opt/ripple/lib",
+            "./pnode1/db:/var/lib/xrpld/db",
         ]
         assert svc["volumes"] == expected_volumes
 

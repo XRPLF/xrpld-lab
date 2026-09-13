@@ -245,7 +245,7 @@ class TestScriptBuilderNetwork:
         wipe = [line for line in result.splitlines() if line.startswith("docker run")]
         assert len(wipe) == 1
         for node in ("vnode1", "vnode2", "pnode1"):
-            for leaf in ("lib", "log", "xrpld.testnet"):
+            for leaf in ("lib", "log", "db", "xrpld.testnet"):
                 assert f" /wipe/{node}/{leaf}" in wipe[0], (node, leaf)
         assert "rm -r " not in result
         # Else branch with just compose down (no --remove-orphans)

@@ -33,7 +33,7 @@ class NodeFactory:
         ips_urls: Optional[List[str]] = None,
         ips_fixed_urls: Optional[List[str]] = None,
         datagram_monitor: Optional[List[str]] = None,
-        database_path: str = "/var/lib/xrpld/db/rdb",
+        database_path: str = "/opt/ripple/lib/db/rdb",
     ) -> NodeConfig:
         """Create a NodeConfig for a standalone node."""
         spec = get_spec(protocol)

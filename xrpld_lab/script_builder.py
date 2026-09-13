@@ -206,7 +206,7 @@ done
         nodes = [f"vnode{i}" for i in range(1, num_validators + 1)]
         nodes += [f"pnode{i}" for i in range(1, num_peers + 1)]
         content += ScriptBuilder.wipe_as_root(
-            [f"{n}/{leaf}" for n in nodes for leaf in ("lib", "log", f"xrpld.{name}")]
+            [f"{n}/{leaf}" for n in nodes for leaf in ("lib", "log", "db", f"xrpld.{name}")]
         )
 
         content += "else \n"

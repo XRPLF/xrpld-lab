@@ -96,7 +96,7 @@ class TestCreateStandalone:
             name="standalone",
             network_id=1,
         )
-        assert node.db_path == "/var/lib/xrpld/db/rdb"
+        assert node.db_path == "/opt/ripple/lib/db/rdb"
 
     def test_debug_path_is_docker(self):
         node = NodeFactory.create_standalone(
