@@ -481,15 +481,15 @@ class Sampler:
             ),
         }
         row.update(self.server_info())
-        row.update(self.from_xdgm())
+        row.update(self.from_xdgm(row))
         self.latest = row
         return row
 
-    def from_xdgm(self):
+    def from_xdgm(self, row):
         """Fields only xrpld can report.
 
         Also carries a fallback for every field the admin RPC would have given
-        if it had answered.
+        `row` if it had answered this tick.
         """
         rec = self.fresh_xdgm()
         if not rec:
@@ -505,7 +505,7 @@ class Sampler:
             "treenode_cache_size": rec.get("treenode_cache_size"),
             "write_load": rec.get("write_load"),
         }
-        if (self.latest or {}).get("server_state") in (None, "unreachable"):
+        if row.get("server_state") in (None, "unreachable"):
             ranges = rec.get("ledger_ranges") or []
             state = rec.get("server_state")
             out.update(
@@ -615,7 +615,8 @@ def record_event(conn, kind, detail):
 
 
 def rollup(conn, src, dst, bucket):
-    """Fold completed buckets of `src` into `dst`. Re-running is harmless."""
+    """Fold completed buckets of `src` into `dst`, starting at the newest bucket
+    `dst` already holds. Re-running is harmless."""
     avg = ", ".join(f"AVG({c}) AS {c}" for c in NUMERIC)
     last = ", ".join(
         f"(SELECT {c} FROM {src} s2 WHERE s2.ts/{bucket} = s1.ts/{bucket}"
@@ -626,7 +627,8 @@ def rollup(conn, src, dst, bucket):
     conn.execute(
         f"INSERT OR REPLACE INTO {dst} (ts, {','.join(NUMERIC)}, {','.join(LAST)}) "
         f"SELECT (ts/{bucket})*{bucket} AS ts, {avg}, {last} FROM {src} s1 "
-        f"WHERE ts < ? GROUP BY ts/{bucket}",
+        f"WHERE ts >= (SELECT COALESCE(MAX(ts), 0) FROM {dst}) AND ts < ? "
+        f"GROUP BY ts/{bucket}",
         (cutoff,),
     )
     conn.commit()
@@ -850,7 +852,7 @@ class Handler(BaseHTTPRequestHandler):
         )
 
     def _events(self, query):
-        limit = min(int(query.get("limit", ["100"])[0]), 1000)
+        limit = max(1, min(int(query.get("limit", ["100"])[0]), 1000))
         conn = connect(self.cfg.db)
         try:
             rows = conn.execute(
