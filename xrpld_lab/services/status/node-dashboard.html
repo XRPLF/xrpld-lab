@@ -135,6 +135,7 @@ const CHARTS = [
     series: [{ key: 'treenode_cache_size', label: 'entries', color: '#a78bfa' }] },
 ];
 
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const fmtBytes = v => {
   if (v == null) return '–';
   const u = ['B', 'KB', 'MB', 'GB', 'TB']; let i = 0;
@@ -221,13 +222,13 @@ function renderStats(latest) {
   const swapPct = latest.swap_total ? 100 * latest.swap_used / latest.swap_total : null;
   const diskPct = latest.disk_total ? 100 * latest.disk_used / latest.disk_total : null;
   const cells = [
-    ['build', latest.build_version || '–'],
+    ['build', esc(latest.build_version || '–')],
     ['uptime', fmtDur(latest.uptime)],
     ['time to sync', latest.initial_sync_s ? fmtDur(latest.initial_sync_s) +
       ` <small>${Math.round(latest.initial_sync_s)}s</small>` : '–'],
     ['peers', fmtNum(latest.peers)],
     ['validated ledger', latest.validated_seq ? fmtNum(latest.validated_seq) : '–'],
-    ['ledgers held', `${fmtNum(latest.ledger_span)} <small>${latest.complete_ledgers || ''}</small>`],
+    ['ledgers held', `${fmtNum(latest.ledger_span)} <small>${esc(latest.complete_ledgers || '')}</small>`],
     ['memory', `${memPct == null ? '–' : memPct.toFixed(0) + '%'} <small>${fmtBytes(latest.mem_used)} / ${fmtBytes(latest.mem_total)}</small>`],
     ['swap', `${swapPct == null ? '–' : swapPct.toFixed(0) + '%'} <small>${fmtBytes(latest.swap_used)} / ${fmtBytes(latest.swap_total)}</small>`],
     ['disk', `${diskPct == null ? '–' : diskPct.toFixed(0) + '%'} <small>${fmtBytes(latest.disk_used)} / ${fmtBytes(latest.disk_total)}</small>`],
@@ -270,8 +271,8 @@ async function poll() {
         : spec.xdgm ? 'no XDGM packets' : '';
     }
     document.getElementById('events').innerHTML = (events.events || []).map(e =>
-      `<tr><td>${new Date(e.ts * 1000).toLocaleString()}</td><td>${e.kind}</td>
-       <td>${e.detail}</td></tr>`).join('') || '<tr><td>no events recorded</td></tr>';
+      `<tr><td>${new Date(e.ts * 1000).toLocaleString()}</td><td>${esc(e.kind)}</td>
+       <td>${esc(e.detail)}</td></tr>`).join('') || '<tr><td>no events recorded</td></tr>';
   } catch (err) {
     document.getElementById('err').textContent = 'cannot reach the metrics API: ' + err.message;
   }
