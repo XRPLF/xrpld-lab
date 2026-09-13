@@ -953,7 +953,7 @@ def _deploy_ansible(workspace: Workspace, name: str) -> bool:
         print("Run 'xrpld-lab create:ansible' first to generate deployment files.")
         return False
 
-    # ansible refuses non-blocking stdio, which a parent process can leave on the inherited fds
+    # ansible refuses non-blocking stdio, which a parent can leave on inherited fds.
     for fd in (0, 1, 2):
         try:
             os.set_blocking(fd, True)
