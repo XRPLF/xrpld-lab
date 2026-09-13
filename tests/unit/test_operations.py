@@ -99,12 +99,38 @@ class TestRunScripts:
 
 
 class TestRemoveNetwork:
-    """Test network directory removal."""
+    """Test network stop-then-remove."""
 
-    def test_removes_existing_directory(self, tmp_path):
+    @patch("xrpld_lab.operations.run_command", return_value=0)
+    def test_stops_with_remove_before_deleting(self, mock_run, tmp_path):
+        net = tmp_path / "my-net"
+        net.mkdir()
+        (net / "stop.sh").write_text("#!/bin/bash\n")
+
+        assert remove_network(_workspace(str(tmp_path)), "my-net") is True
+
+        mock_run.assert_called_once_with(str(net), "bash stop.sh --remove")
+        assert not net.exists()
+
+    @patch("xrpld_lab.operations.run_command", return_value=1)
+    def test_failed_stop_keeps_the_directory(self, mock_run, tmp_path, capsys):
+        net = tmp_path / "my-net"
+        net.mkdir()
+        (net / "stop.sh").write_text("#!/bin/bash\n")
+
+        assert remove_network(_workspace(str(tmp_path)), "my-net") is False
+
+        assert net.is_dir()
+        assert (net / "stop.sh").is_file()
+        assert f"stop.sh --remove failed; {net} kept" in capsys.readouterr().out
+
+    @patch("xrpld_lab.operations.run_command")
+    def test_directory_without_stop_script_is_removed(self, mock_run, tmp_path):
         (tmp_path / "my-net").mkdir()
 
         assert remove_network(_workspace(str(tmp_path)), "my-net") is True
+
+        mock_run.assert_not_called()
         assert not (tmp_path / "my-net").exists()
 
     def test_missing_directory_prints_error(self, tmp_path, capsys):
@@ -222,12 +248,22 @@ class TestLocalScripts:
         stop = tmp_path / "build" / "stop.sh"
         assert start.read_text() == (
             "#!/bin/bash\n"
+            "echo $$ > xrpld.pid\n"
             "exec ./xrpld -a --conf config/xrpld.cfg --ledgerfile config/genesis.json\n"
         )
         assert stop.read_text() == (
             "#!/bin/bash\n"
-            "pkill -f './xrpld' && echo \"xrpld stopped\""
-            ' || echo "No running xrpld found"\n'
+            "if [ ! -f xrpld.pid ]; then\n"
+            '  echo "xrpld.pid not found in $(pwd): no xrpld started by start.sh here"\n'
+            "  exit 1\n"
+            "fi\n"
+            "PID=$(cat xrpld.pid)\n"
+            'if kill "$PID" 2>/dev/null; then\n'
+            '  echo "xrpld (PID $PID) stopped"\n'
+            "else\n"
+            '  echo "No running xrpld with PID $PID (stale xrpld.pid)"\n'
+            "fi\n"
+            "rm -f xrpld.pid\n"
         )
         assert os.access(start, os.X_OK) and os.access(stop, os.X_OK)
         assert (tmp_path / "build" / "db").is_dir()
@@ -266,25 +302,26 @@ class TestLocalScripts:
 
         assert (tmp_path / "build" / "start.sh").read_text() == (
             "#!/bin/bash\n"
+            "echo $$ > xrpld.pid\n"
             "exec ./xrpld  --conf config/xrpld.cfg --ledgerfile config/genesis.json\n"
         )
 
     @patch("xrpld_lab.operations.subprocess.run")
-    def test_start_local_without_supported_features_raises(
-        self, mock_run, tmp_path, monkeypatch
+    def test_start_local_without_supported_features_writes_nothing(
+        self, mock_run, tmp_path, monkeypatch, capsys
     ):
-        # update_genesis raises when no amendment is Supported::yes; start_local
-        # does not turn that into a False return.
         build = self._build_tree(
             tmp_path, "XRPL_FEATURE(DID, Supported::no, VoteBehavior::DefaultNo)"
         )
         monkeypatch.chdir(build)
 
-        with pytest.raises(RuntimeError, match="No features found for xrpl"):
-            start_local(network_id=1234)
+        assert start_local(network_id=1234) is False
 
         mock_run.assert_not_called()
-        assert not (tmp_path / "build" / "start.sh").exists()
+        assert sorted(p.name for p in (tmp_path / "build").iterdir()) == ["xrpld"]
+        out = capsys.readouterr().out
+        assert "No Supported::yes amendment in" in out
+        assert "features.macro; nothing written" in out
 
     @patch("xrpld_lab.operations.subprocess.run")
     def test_start_local_without_a_features_file_returns_false(

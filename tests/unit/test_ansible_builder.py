@@ -86,6 +86,18 @@ def _services_host(name="proxy", ip="10.0.0.10", **kwargs) -> ServicesHost:
 # ===========================================================================
 
 
+class TestAddNode:
+    def test_empty_ip_is_rejected(self, tmp_path):
+        builder = AnsibleBuilder(
+            cluster_dir=str(tmp_path),
+            config=_basic_config(),
+            image_name="transia/cluster:abc123",
+        )
+        with pytest.raises(ValueError, match="vnode3 has no IP address"):
+            builder.add_node("vnode3", "", _validator_ports(3), "cfg/", "validator")
+        assert builder._nodes == []
+
+
 class TestCoreFiles:
     def test_write_creates_ansible_dir(self, tmp_path):
         builder = _build_basic(tmp_path)
