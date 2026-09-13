@@ -16,6 +16,7 @@ from xrpld_lab.config import (
     parse_xrpld_cfg,
     load_overrides_file,
     apply_overrides,
+    load_ansible_config,
     _deep_merge,
 )
 
@@ -394,3 +395,48 @@ class TestCliConfigOverrides:
         args = parser.parse_args(["up:standalone", "--protocol", "xrpl"])
         cfg = build_lab_config(args)
         assert cfg.config_overrides == {}
+
+
+class TestApplyOverridesTextShape:
+    """Lines before the first header and a missing trailing newline."""
+
+    def test_text_before_the_first_section_is_kept(self):
+        out = apply_overrides(
+            "# rendered by xrpld-lab\n[node_size]\nhuge\n\n", {"node_size": "small"}
+        )
+        assert out == "# rendered by xrpld-lab\n[node_size]\nsmall\n\n"
+
+    def test_appending_to_text_without_a_trailing_newline(self):
+        out = apply_overrides("[node_size]\nhuge", {"network_id": 4242})
+        assert out == "[node_size]\nhuge\n\n[network_id]\n4242\n\n"
+
+    def test_appending_two_sections_separates_them_with_a_blank_line(self):
+        out = apply_overrides("[node_size]\nhuge\n", {"network_id": 1, "ssl_verify": 0})
+        assert out == "[node_size]\nhuge\n\n[network_id]\n1\n\n[ssl_verify]\n0\n\n"
+
+
+class TestLoadAnsibleConfig:
+    def test_loads_the_mapping(self, tmp_path):
+        path = tmp_path / "ansible.yaml"
+        path.write_text("ssh_user: ubuntu\nvips:\n  - 10.0.0.1\n")
+        assert load_ansible_config(str(path)) == {
+            "ssh_user": "ubuntu",
+            "vips": ["10.0.0.1"],
+        }
+
+    def test_missing_file_raises(self, tmp_path):
+        path = tmp_path / "absent.yaml"
+        with pytest.raises(FileNotFoundError, match="Ansible config not found"):
+            load_ansible_config(str(path))
+
+    def test_empty_file_raises(self, tmp_path):
+        path = tmp_path / "empty.yaml"
+        path.write_text("")
+        with pytest.raises(ValueError, match="Invalid ansible config"):
+            load_ansible_config(str(path))
+
+    def test_non_mapping_raises(self, tmp_path):
+        path = tmp_path / "list.yaml"
+        path.write_text("- 10.0.0.1\n- 10.0.0.2\n")
+        with pytest.raises(ValueError, match="Invalid ansible config"):
+            load_ansible_config(str(path))

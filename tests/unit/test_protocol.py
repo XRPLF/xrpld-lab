@@ -17,6 +17,10 @@ class TestGetSpec:
         spec = get_spec(Protocol.XRPL)
         assert spec is XRPL
 
+    def test_unknown_protocol_raises_value_error(self):
+        with pytest.raises(ValueError, match="No protocol spec for 'xahau'"):
+            get_spec("xahau")
+
 
 class TestXrplSpec:
     """Test XRPL protocol spec values."""

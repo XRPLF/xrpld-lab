@@ -13,6 +13,7 @@ from xrpld_lab.amendments import (
     convert_to_list_of_hashes,
     update_genesis,
 )
+from xrpld_lab.ledger_generator import generate
 
 
 def _amendment_hash(name: str) -> str:
@@ -315,3 +316,51 @@ class TestUpdateGenesis:
         """No amendments at all is an error -> fail loud, never a silent empty genesis."""
         with pytest.raises(RuntimeError, match="No features found"):
             update_genesis({}, "xrpl")
+
+
+class TestParseAmendmentsMalformedMacros:
+    """A macro keyword with no argument list is skipped, not raised on."""
+
+    @pytest.mark.parametrize(
+        "line", ["XRPL_FIX", "XRPL_FEATURE", "REGISTER_FIX", "REGISTER_FEATURE"]
+    )
+    def test_macro_without_arguments_is_skipped(self, line):
+        assert parse_amendments([line]) == {}
+
+    def test_malformed_line_does_not_drop_the_rest(self):
+        lines = [
+            "XRPL_FIX",
+            "REGISTER_FEATURE",
+            "XRPL_FEATURE(Good, Supported::yes, DefaultVote::yes,",
+        ]
+        assert parse_amendments(lines) == {"Good": _amendment_hash("Good")}
+
+
+class TestUpdateGenesisPreload:
+    """preload_entries are merged into the template and XRP stays conserved."""
+
+    def test_preload_entries_are_merged_and_xrp_is_conserved(self):
+        entries, _ = generate(3, balance_drops="2500000000", num_trustlines=2)
+
+        result = update_genesis({"Feature1": "HASH1"}, "xrpl", preload_entries=entries)
+
+        state = result["ledger"]["accountState"]
+        indexes = {e.get("index") for e in state}
+        assert all(e["index"] in indexes for e in entries)
+        roots = [e for e in state if e.get("LedgerEntryType") == "AccountRoot"]
+        assert len(roots) == 4
+        assert sum(int(e["Balance"]) for e in roots) == int(
+            result["ledger"]["total_coins"]
+        )
+        assert sum(1 for e in state if e.get("LedgerEntryType") == "RippleState") == 2
+        amendments = [e for e in state if e.get("LedgerEntryType") == "Amendments"]
+        assert amendments[0]["Amendments"] == ["HASH1"]
+
+    def test_no_preload_leaves_the_template_state_alone(self):
+        result = update_genesis({"Feature1": "HASH1"}, "xrpl", preload_entries=None)
+        roots = [
+            e
+            for e in result["ledger"]["accountState"]
+            if e.get("LedgerEntryType") == "AccountRoot"
+        ]
+        assert len(roots) == 1

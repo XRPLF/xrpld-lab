@@ -849,3 +849,19 @@ class TestValidatorsTxtBootstrapVl:
         out = ValidatorsTxtBuilder(cfg, genesis=False, bootstrap_vl=True).build()
         assert "[validators]\n" not in out
         assert "[validator_list_sites]\n" in out
+
+
+class TestXrpldCfgBuilderTreeCacheTargetEntries:
+    """[tree_cache_target_entries] follows [tree_cache_ram_percent] when set."""
+
+    def test_positive_value_emits_the_section(self):
+        cfg = _make_standalone_config(tree_cache_target_entries=40_000_000)
+        output = XrpldCfgBuilder(cfg).build()
+        assert "[tree_cache_target_entries]\n40000000\n\n" in output
+        assert output.index("[tree_cache_ram_percent]") < output.index(
+            "[tree_cache_target_entries]"
+        )
+
+    def test_zero_omits_the_section(self):
+        output = XrpldCfgBuilder(_make_standalone_config()).build()
+        assert "[tree_cache_target_entries]" not in output

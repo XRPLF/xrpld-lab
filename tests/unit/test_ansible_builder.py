@@ -2121,3 +2121,69 @@ class TestTemplateBraces:
     @pytest.mark.parametrize("name", FORMATTED)
     def test_formatted_template_has_no_bare_jinja_braces(self, name):
         assert re.search(r"(?<!\{)\{\{ ", getattr(ansible_builder, name)) is None
+
+
+class TestAlloyBuildContextRewrite:
+    def test_second_write_replaces_the_copied_build_context(self, tmp_path):
+        source = tmp_path / "alloy-src" / "docker"
+        source.mkdir(parents=True)
+        (source / "alloy.Dockerfile").write_text("FROM grafana/alloy\n")
+        cluster_dir = str(tmp_path / "alloy-cluster")
+        os.makedirs(cluster_dir)
+        config = AnsibleConfig(
+            vips=["10.0.0.1"],
+            alloy=AlloyConfig(
+                push_host="push.example.test", source_dir=str(tmp_path / "alloy-src")
+            ),
+        )
+        builder = AnsibleBuilder(cluster_dir, config, "transia/cluster:abc123")
+        builder.add_node(
+            "vnode1", "10.0.0.1", _validator_ports(1), f"{cluster_dir}/vnode1/config/"
+        )
+        builder.write()
+        alloy_dir = os.path.join(builder.ansible_dir, "alloy")
+        stale = os.path.join(alloy_dir, "stale.txt")
+        with open(stale, "w") as f:
+            f.write("left over from the previous write\n")
+
+        builder.write()
+
+        assert not os.path.exists(stale)
+        assert os.path.exists(os.path.join(alloy_dir, "docker", "alloy.Dockerfile"))
+
+
+class TestCompilerVolumes:
+    def _vars(self, tmp_path, compiler):
+        cluster_dir = str(tmp_path / "test-cluster")
+        os.makedirs(cluster_dir, exist_ok=True)
+        config = AnsibleConfig(
+            vips=["10.0.0.1"],
+            pips=["10.0.0.10"],
+            services=[ServicesHost(name="infra", ip="10.0.0.10", compiler=compiler)],
+        )
+        builder = AnsibleBuilder(cluster_dir, config, "transia/cluster:abc")
+        builder.add_node(
+            "vnode1", "10.0.0.1", _validator_ports(1), f"{cluster_dir}/vnode1/config/"
+        )
+        builder.add_node(
+            "pnode1",
+            "10.0.0.10",
+            _peer_ports(1),
+            f"{cluster_dir}/pnode1/config/",
+            "peer",
+        )
+        builder.write()
+        path = os.path.join(
+            builder.ansible_dir, "services", "infra", "compiler", "vars.yml"
+        )
+        with open(path) as f:
+            return yaml.safe_load(f)
+
+    def test_volumes_reach_vars_yml(self, tmp_path):
+        data = self._vars(
+            tmp_path, CompilerConfig(volumes=["/srv/compiler/cache:/root/.cache"])
+        )
+        assert data["docker_volumes"] == ["/srv/compiler/cache:/root/.cache"]
+
+    def test_no_volumes_means_no_docker_volumes_key(self, tmp_path):
+        assert "docker_volumes" not in self._vars(tmp_path, CompilerConfig())
