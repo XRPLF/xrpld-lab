@@ -49,12 +49,6 @@ from xrpld_lab.workspace import Workspace
 from xrpld_lab.workflows import LabRunner
 
 # ---------------------------------------------------------------------------
-# Fallback versions (used when no --version / --build_version is provided)
-# ---------------------------------------------------------------------------
-
-_XRPL_RELEASE_FALLBACK: str = "3.3.0"
-
-# ---------------------------------------------------------------------------
 # Default VL keys
 # ---------------------------------------------------------------------------
 
@@ -689,7 +683,7 @@ def _build_standalone_config(args, protocol, spec):
         commit_hash = ref
     else:
         server = server or "rippleci"
-        version = version or _XRPL_RELEASE_FALLBACK
+        version = version or spec.default_build_version
         image = f"{server}/xrpld:{version}"
 
     source = BuildSource(
@@ -700,14 +694,18 @@ def _build_standalone_config(args, protocol, spec):
         owner=spec.github_owner,
         repo=spec.github_repo,
         commit_hash=commit_hash,
-        image=image or "ubuntu:jammy",
+        image=image,
     )
 
     return LabConfig(
         protocol=protocol,
         mode=DeployMode.STANDALONE,
         build_source=source,
-        network_id=args.network_id or spec.default_standalone_network_id,
+        network_id=(
+            args.network_id
+            if args.network_id is not None
+            else spec.default_standalone_network_id
+        ),
         log_level=args.log_level,
         node_db_type=NodeDbType(args.nodedb_type),
         add_ipfs=args.ipfs,
@@ -751,11 +749,11 @@ def _build_network_config(args, protocol, spec):
         build_type = BuildType.BINARY
     elif has_local:
         server = server or "https://github.com/XRPLF/rippled/tree"
-        version = version or _XRPL_RELEASE_FALLBACK
+        version = version or spec.default_build_version
         build_type = BuildType.BINARY
     else:
         server = server or spec.default_build_server
-        version = version or _XRPL_RELEASE_FALLBACK
+        version = version or spec.default_build_version
         default_image = f"{server}/xrpld:{version}"
 
     # Explicit cluster name (workspace dir) overrides the branch-derived one.
@@ -816,7 +814,9 @@ def _build_network_config(args, protocol, spec):
         protocol=protocol,
         mode=mode,
         build_source=source,
-        network_id=args.network_id or spec.default_network_id,
+        network_id=(
+            args.network_id if args.network_id is not None else spec.default_network_id
+        ),
         log_level=log_level,
         num_validators=num_validators,
         num_peers=num_peers,
@@ -846,6 +846,16 @@ def _build_network_config(args, protocol, spec):
         preload_balance=getattr(args, "preload_balance", "1000000000"),
         preload_currency=getattr(args, "preload_currency", "USD"),
     )
+
+
+def _local_network_id(args: argparse.Namespace) -> int:
+    """--network_id as given, else the spec default for the local network type."""
+    if args.network_id is not None:
+        return args.network_id
+    spec = get_spec(Protocol(args.protocol))
+    if args.network_type == "standalone":
+        return spec.default_standalone_network_id
+    return spec.default_network_id
 
 
 # ---------------------------------------------------------------------------
@@ -899,7 +909,7 @@ def main() -> None:
         ok = start_local(
             protocol=args.protocol,
             network_type=args.network_type,
-            network_id=args.network_id,
+            network_id=_local_network_id(args),
             log_level=args.log_level,
             nodedb_type=args.nodedb_type,
             public_key=args.public_key,

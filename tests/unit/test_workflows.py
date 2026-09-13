@@ -22,7 +22,7 @@ from xrpld_lab.models import (
 )
 from xrpld_lab.protocol import get_spec, XRPL
 from xrpld_lab.workspace import Workspace
-from xrpld_lab.workflows import LabRunner
+from xrpld_lab.workflows import LabRunner, explorer_target
 
 
 # ---------------------------------------------------------------------------
@@ -131,17 +131,20 @@ def _make_node(name="test", role=NodeRole.STANDALONE) -> NodeConfig:
 class TestLabRunnerConstruction:
     """LabRunner.__init__ wiring."""
 
-    def test_creates_with_lab_config_and_default_workspace(self, standalone_lab):
+    def test_default_workspace_is_under_the_cwd(
+        self, standalone_lab, tmp_path, monkeypatch
+    ):
+        monkeypatch.chdir(tmp_path)
         runner = LabRunner(standalone_lab)
         assert runner.lab is standalone_lab
-        assert isinstance(runner.workspace, Workspace)
+        assert runner.workspace.base == str(tmp_path / "workspace")
 
     def test_creates_with_custom_workspace(self, standalone_lab, tmp_workspace):
         runner = LabRunner(standalone_lab, workspace=tmp_workspace)
         assert runner.workspace is tmp_workspace
 
-    def test_spec_matches_protocol_xrpl(self, standalone_lab):
-        runner = LabRunner(standalone_lab)
+    def test_spec_matches_protocol_xrpl(self, standalone_lab, tmp_workspace):
+        runner = LabRunner(standalone_lab, workspace=tmp_workspace)
         assert runner.spec is XRPL
 
 
@@ -328,8 +331,16 @@ class TestRunStandalone:
             network_id=1,
             log_level="trace",
             node_db_type=NodeDbType.NUDB,
+            vl_keys=None,
             datagram_monitor=None,
         )
+
+    def test_public_vl_key_reaches_the_node(self):
+        self.lab.public_vl_key = "EDPUBLISHER"
+        self.runner._run_standalone()
+        assert self.mocks["create_standalone"].call_args.kwargs["vl_keys"] == [
+            "EDPUBLISHER"
+        ]
 
     def test_builds_cfg_with_xrpld_cfg_builder(self):
         self.runner._run_standalone()
@@ -626,7 +637,9 @@ class TestRunNetwork:
         assert self.mock_compose_instance.add_node_service.call_count == 3
         # VL and explorer services
         self.mock_compose_instance.add_vl_service.assert_called_once()
-        self.mock_compose_instance.add_explorer_service.assert_called_once()
+        self.mock_compose_instance.add_explorer_service.assert_called_once_with(
+            ws_port=PortSet.for_node(1, NodeRole.PEER).ws_admin, standalone=False
+        )
 
     def test_creates_start_stop_scripts(self):
         self.runner._run_network()
@@ -821,7 +834,27 @@ class TestRunLocalNetwork:
         # Local network only has VL + explorer in Docker, no node services
         self.mock_compose_instance.add_node_service.assert_not_called()
         self.mock_compose_instance.add_vl_service.assert_called_once()
-        self.mock_compose_instance.add_explorer_service.assert_called_once()
+        self.mock_compose_instance.add_explorer_service.assert_called_once_with(
+            ws_port=6016, standalone=False
+        )
+
+    def test_explorer_and_start_script_follow_pnode1_under_port_offset(self):
+        self.lab.port_offset = 1000
+        self.runner._run_local_network()
+        self.mock_compose_instance.add_explorer_service.assert_called_once_with(
+            ws_port=7016, standalone=False
+        )
+        kwargs = self.mocks["script_start"].call_args.kwargs
+        assert (kwargs["ws_node"], kwargs["ws_port"]) == ("pnode1", 7016)
+
+    def test_explorer_follows_vnode1_without_peers(self):
+        self.lab.num_peers = 0
+        self.runner._run_local_network()
+        self.mock_compose_instance.add_explorer_service.assert_called_once_with(
+            ws_port=6106, standalone=False
+        )
+        kwargs = self.mocks["script_start"].call_args.kwargs
+        assert (kwargs["ws_node"], kwargs["ws_port"]) == ("vnode1", 6106)
 
     def test_creates_start_stop_scripts(self):
         self.runner._run_local_network()
@@ -838,13 +871,12 @@ class TestRunLocalNetwork:
 # ---------------------------------------------------------------------------
 
 
-class TestRunNetworkWithAnsible:
-    """Test that _run_network calls AnsibleBuilder when lab.ansible is set."""
-
-    def setup_method(self):
-        from xrpld_lab.models import AnsibleConfig
-
-        self.source = BuildSource(
+def _network_lab(ansible):
+    """Two-validator, one-peer network LabConfig with an optional AnsibleConfig."""
+    return LabConfig(
+        protocol=Protocol.XRPL,
+        mode=DeployMode.NETWORK,
+        build_source=BuildSource(
             protocol=Protocol.XRPL,
             build_type=BuildType.IMAGE,
             build_server="rippleci",
@@ -852,61 +884,70 @@ class TestRunNetworkWithAnsible:
             owner="XRPLF",
             repo="rippled",
             image="rippleci/xrpld:3.1.1",
-        )
-        self.ansible_config = AnsibleConfig(
-            ssh_port=22,
-            ssh_user="ubuntu",
-            ssh_key_path="~/.ssh/id_rsa",
-            vips=["10.0.0.1", "10.0.0.2"],
-            pips=["10.0.0.3"],
-        )
-        self.lab = LabConfig(
-            protocol=Protocol.XRPL,
-            mode=DeployMode.NETWORK,
-            build_source=self.source,
-            network_id=21337,
-            num_validators=2,
-            num_peers=1,
-            genesis=True,
-            log_level="warning",
-            ansible=self.ansible_config,
-        )
-        self.workspace = Workspace(base="/tmp/test-ws")
+        ),
+        network_id=21337,
+        num_validators=2,
+        num_peers=1,
+        genesis=True,
+        log_level="warning",
+        ansible=ansible,
+    )
 
+
+def _ansible_config():
+    from xrpld_lab.models import AnsibleConfig
+
+    return AnsibleConfig(
+        ssh_port=22,
+        ssh_user="ubuntu",
+        ssh_key_path="~/.ssh/id_rsa",
+        vips=["10.0.0.1", "10.0.0.2"],
+        pips=["10.0.0.3"],
+    )
+
+
+_NETWORK_PATCH_TARGETS = [
+    ("resolver", "xrpld_lab.workflows.SourceResolver"),
+    ("publisher", "xrpld_lab.workflows.PublisherClient"),
+    ("validator_client", "xrpld_lab.workflows.ValidatorClient"),
+    ("node_factory", "xrpld_lab.workflows.NodeFactory"),
+    ("cfg_builder", "xrpld_lab.workflows.XrpldCfgBuilder"),
+    ("vl_builder", "xrpld_lab.workflows.ValidatorsTxtBuilder"),
+    ("compose_builder", "xrpld_lab.workflows.ComposeBuilder"),
+    ("dockerfile_builder", "xrpld_lab.workflows.DockerfileBuilder"),
+    ("script_start", "xrpld_lab.workflows.ScriptBuilder.network_start"),
+    ("script_stop", "xrpld_lab.workflows.ScriptBuilder.network_stop"),
+    ("parse_amendments", "xrpld_lab.workflows.parse_amendments"),
+    ("update_genesis", "xrpld_lab.workflows.update_genesis"),
+    ("get_lines", "xrpld_lab.workflows.get_feature_lines_from_content"),
+    ("write_file", "xrpld_lab.workflows.write_file"),
+    ("save_config", "xrpld_lab.workflows.save_config"),
+    ("write_executable", "xrpld_lab.workflows.write_executable"),
+    ("makedirs", "xrpld_lab.workflows.os.makedirs"),
+    ("chdir", "xrpld_lab.workflows.os.chdir"),
+    ("getcwd", "xrpld_lab.workflows.os.getcwd"),
+    ("exists", "xrpld_lab.workflows.os.path.exists"),
+    ("copy2", "xrpld_lab.workflows.shutil.copy2"),
+    ("copyfile", "xrpld_lab.workflows.shutil.copyfile"),
+    ("ansible_builder", "xrpld_lab.workflows.AnsibleBuilder"),
+]
+
+
+class _NetworkRunnerSetup:
+    """Patches every collaborator of _run_network; subclasses set ``ansible``."""
+
+    ansible: bool
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, tmp_workspace):
+        self.lab = _network_lab(_ansible_config() if self.ansible else None)
+        self.workspace = tmp_workspace
         self.patches = {}
         self.mocks = {}
-
-        patcher_list = [
-            ("resolver", "xrpld_lab.workflows.SourceResolver"),
-            ("publisher", "xrpld_lab.workflows.PublisherClient"),
-            ("validator_client", "xrpld_lab.workflows.ValidatorClient"),
-            ("node_factory", "xrpld_lab.workflows.NodeFactory"),
-            ("cfg_builder", "xrpld_lab.workflows.XrpldCfgBuilder"),
-            ("vl_builder", "xrpld_lab.workflows.ValidatorsTxtBuilder"),
-            ("compose_builder", "xrpld_lab.workflows.ComposeBuilder"),
-            ("dockerfile_builder", "xrpld_lab.workflows.DockerfileBuilder"),
-            ("script_start", "xrpld_lab.workflows.ScriptBuilder.network_start"),
-            ("script_stop", "xrpld_lab.workflows.ScriptBuilder.network_stop"),
-            ("parse_amendments", "xrpld_lab.workflows.parse_amendments"),
-            ("update_genesis", "xrpld_lab.workflows.update_genesis"),
-            ("get_lines", "xrpld_lab.workflows.get_feature_lines_from_content"),
-            ("write_file", "xrpld_lab.workflows.write_file"),
-            ("save_config", "xrpld_lab.workflows.save_config"),
-            ("write_executable", "xrpld_lab.workflows.write_executable"),
-            ("makedirs", "xrpld_lab.workflows.os.makedirs"),
-            ("chdir", "xrpld_lab.workflows.os.chdir"),
-            ("getcwd", "xrpld_lab.workflows.os.getcwd"),
-            ("exists", "xrpld_lab.workflows.os.path.exists"),
-            ("copy2", "xrpld_lab.workflows.shutil.copy2"),
-            ("copyfile", "xrpld_lab.workflows.shutil.copyfile"),
-            ("ansible_builder", "xrpld_lab.workflows.AnsibleBuilder"),
-        ]
-
-        for name, target in patcher_list:
+        for name, target in _NETWORK_PATCH_TARGETS:
             self.patches[name] = patch(target)
             self.mocks[name] = self.patches[name].start()
 
-        # Configure mocks
         self.mocks["resolver"].return_value.resolve_features.return_value = b"feature"
         self.mocks["resolver"].return_value.resolve_repo_config.return_value = {}
         self.mocks["get_lines"].return_value = ["line"]
@@ -935,22 +976,20 @@ class TestRunNetworkWithAnsible:
         mock_cfg.build.return_value = "[server]\nport=5005"
         self.mocks["cfg_builder"].return_value = mock_cfg
         self.mocks["vl_builder"].return_value = mock_cfg
-
-        mock_compose = MagicMock()
-        self.mocks["compose_builder"].return_value = mock_compose
-
-        mock_dockerfile = MagicMock()
-        mock_dockerfile.build.return_value = "FROM ubuntu"
+        self.mocks["compose_builder"].return_value = MagicMock()
         self.mocks["dockerfile_builder"].build = MagicMock(return_value="FROM ubuntu")
-
-        mock_ansible = MagicMock()
-        self.mocks["ansible_builder"].return_value = mock_ansible
+        self.mocks["ansible_builder"].return_value = MagicMock()
 
         self.runner = LabRunner(self.lab, self.workspace)
-
-    def teardown_method(self):
+        yield
         for p in self.patches.values():
             p.stop()
+
+
+class TestRunNetworkWithAnsible(_NetworkRunnerSetup):
+    """Test that _run_network calls AnsibleBuilder when lab.ansible is set."""
+
+    ansible = True
 
     def test_ansible_builder_called_when_config_set(self):
         self.runner._run_network()
@@ -985,107 +1024,20 @@ class TestRunNetworkWithAnsible:
         assert calls[2].kwargs["role"] == "peer"
 
 
-class TestRunNetworkWithoutAnsible:
+class TestRunNetworkWithoutAnsible(_NetworkRunnerSetup):
     """Test that _run_network does NOT call AnsibleBuilder when ansible is None."""
 
-    def setup_method(self):
-        self.source = BuildSource(
-            protocol=Protocol.XRPL,
-            build_type=BuildType.IMAGE,
-            build_server="rippleci",
-            build_version="3.1.1",
-            owner="XRPLF",
-            repo="rippled",
-            image="rippleci/xrpld:3.1.1",
-        )
-        self.lab = LabConfig(
-            protocol=Protocol.XRPL,
-            mode=DeployMode.NETWORK,
-            build_source=self.source,
-            network_id=21337,
-            num_validators=2,
-            num_peers=1,
-            genesis=True,
-            log_level="warning",
-            ansible=None,
-        )
-        self.workspace = Workspace(base="/tmp/test-ws")
-
-        patcher_list = [
-            ("resolver", "xrpld_lab.workflows.SourceResolver"),
-            ("publisher", "xrpld_lab.workflows.PublisherClient"),
-            ("validator_client", "xrpld_lab.workflows.ValidatorClient"),
-            ("node_factory", "xrpld_lab.workflows.NodeFactory"),
-            ("cfg_builder", "xrpld_lab.workflows.XrpldCfgBuilder"),
-            ("vl_builder", "xrpld_lab.workflows.ValidatorsTxtBuilder"),
-            ("compose_builder", "xrpld_lab.workflows.ComposeBuilder"),
-            ("dockerfile_builder", "xrpld_lab.workflows.DockerfileBuilder"),
-            ("script_start", "xrpld_lab.workflows.ScriptBuilder.network_start"),
-            ("script_stop", "xrpld_lab.workflows.ScriptBuilder.network_stop"),
-            ("parse_amendments", "xrpld_lab.workflows.parse_amendments"),
-            ("update_genesis", "xrpld_lab.workflows.update_genesis"),
-            ("get_lines", "xrpld_lab.workflows.get_feature_lines_from_content"),
-            ("write_file", "xrpld_lab.workflows.write_file"),
-            ("save_config", "xrpld_lab.workflows.save_config"),
-            ("write_executable", "xrpld_lab.workflows.write_executable"),
-            ("makedirs", "xrpld_lab.workflows.os.makedirs"),
-            ("chdir", "xrpld_lab.workflows.os.chdir"),
-            ("getcwd", "xrpld_lab.workflows.os.getcwd"),
-            ("exists", "xrpld_lab.workflows.os.path.exists"),
-            ("copy2", "xrpld_lab.workflows.shutil.copy2"),
-            ("copyfile", "xrpld_lab.workflows.shutil.copyfile"),
-            ("ansible_builder", "xrpld_lab.workflows.AnsibleBuilder"),
-        ]
-        self.patches = {}
-        self.mocks = {}
-        for name, target in patcher_list:
-            self.patches[name] = patch(target)
-            self.mocks[name] = self.patches[name].start()
-
-        self.mocks["resolver"].return_value.resolve_features.return_value = b"feature"
-        self.mocks["resolver"].return_value.resolve_repo_config.return_value = {}
-        self.mocks["get_lines"].return_value = ["line"]
-        self.mocks["parse_amendments"].return_value = {}
-        self.mocks["update_genesis"].return_value = {"ledger": {}}
-        self.mocks["exists"].return_value = True
-        self.mocks["getcwd"].return_value = "/old"
-        self.mocks["script_start"].return_value = "#!/bin/bash"
-        self.mocks["script_stop"].return_value = "#!/bin/bash"
-
-        mock_pub = MagicMock()
-        mock_pub.get_keys.return_value = {"publicKey": "EDPUBKEY"}
-        self.mocks["publisher"].return_value = mock_pub
-
-        mock_vc = MagicMock()
-        mock_vc.get_keys.return_value = {"public_key": "VALKEY"}
-        mock_vc.read_token.return_value = "token"
-        mock_vc.read_manifest.return_value = "manifest"
-        self.mocks["validator_client"].return_value = mock_vc
-
-        mock_node = _make_node("vnode1", NodeRole.VALIDATOR)
-        self.mocks["node_factory"].create_validator.return_value = mock_node
-        self.mocks["node_factory"].create_peer.return_value = mock_node
-
-        mock_cfg = MagicMock()
-        mock_cfg.build.return_value = "[server]"
-        self.mocks["cfg_builder"].return_value = mock_cfg
-        self.mocks["vl_builder"].return_value = mock_cfg
-        self.mocks["compose_builder"].return_value = MagicMock()
-        self.mocks["dockerfile_builder"].build = MagicMock(return_value="FROM ubuntu")
-
-        self.runner = LabRunner(self.lab, self.workspace)
-
-    def teardown_method(self):
-        for p in self.patches.values():
-            p.stop()
+    ansible = False
 
     def test_ansible_builder_not_called(self):
         self.runner._run_network()
         self.mocks["ansible_builder"].assert_not_called()
 
 
-class TestNonGenesisNetwork(TestRunNetworkWithAnsible):
+class TestNonGenesisNetwork(_NetworkRunnerSetup):
     """A preserved (non-genesis) network writes no genesis and keeps its identity."""
+
+    ansible = True
 
     def test_no_genesis_written(self):
         self.lab.genesis = False
@@ -1120,6 +1072,20 @@ class TestNonGenesisNetwork(TestRunNetworkWithAnsible):
         self.mocks["exists"].return_value = False
         with pytest.raises(RuntimeError, match="would change the"):
             LabRunner(self.lab, self.workspace).run()
+
+
+class TestExplorerTarget:
+    """explorer_target picks the node and admin websocket port the explorer follows."""
+
+    def test_pnode1_when_the_cluster_has_peers(self):
+        assert explorer_target(1) == ("pnode1", 6016)
+
+    def test_vnode1_without_peers(self):
+        assert explorer_target(0) == ("vnode1", 6106)
+
+    def test_port_offset_shifts_the_port(self):
+        assert explorer_target(1, 1000) == ("pnode1", 7016)
+        assert explorer_target(0, 1000) == ("vnode1", 7106)
 
 
 class TestStageBinary:

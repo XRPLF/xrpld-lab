@@ -143,7 +143,7 @@ class TestStandaloneRender:
         _, out = standalone_tree
         text = (out / "config" / "validators.txt").read_text()
         assert "[validator_list_sites]\n" in text
-        assert "[validator_list_keys]\n" in text
+        assert f"[validator_list_keys]\n    {cli._DEFAULT_VL_KEY}\n" in text
 
     def test_genesis_enables_only_supported_amendments(self, standalone_tree):
         _, out = standalone_tree

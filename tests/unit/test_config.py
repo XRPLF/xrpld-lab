@@ -156,6 +156,34 @@ class TestParseXrpldCfg:
         result = parse_xrpld_cfg(content)
         assert result["node_size"] == "huge"
 
+    def test_repeated_list_section_appends_lines(self):
+        content = "[ips_fixed]\n10.0.0.1 51235\n10.0.0.2 51235\n\n[ips_fixed]\n10.0.0.3 51235\n"
+        result = parse_xrpld_cfg(content)
+        assert result == {
+            "ips_fixed": ["10.0.0.1 51235", "10.0.0.2 51235", "10.0.0.3 51235"]
+        }
+
+    def test_repeated_dict_section_merges_keys(self):
+        content = (
+            "[node_db]\ntype=NuDB\npath=/a\n\n[node_db]\npath=/b\nonline_delete=256\n"
+        )
+        result = parse_xrpld_cfg(content)
+        assert result == {
+            "node_db": {"type": "NuDB", "path": "/b", "online_delete": "256"}
+        }
+
+    def test_repeated_scalar_section_becomes_a_list(self):
+        content = "[ips]\nr.ripple.com 51235\n\n[ips]\ns.ripple.com 51235\n"
+        result = parse_xrpld_cfg(content)
+        assert result == {"ips": ["r.ripple.com 51235", "s.ripple.com 51235"]}
+
+    def test_repeated_section_of_mixed_shape_keeps_every_line(self):
+        content = '[rpc_startup]\n{ "command": "log_level" }\n\n[rpc_startup]\nseverity = warning\n'
+        result = parse_xrpld_cfg(content)
+        assert result == {
+            "rpc_startup": ['{ "command": "log_level" }', "severity = warning"]
+        }
+
     def test_mixed_sections(self):
         """Mix of single value, kv pairs, and list in one config."""
         content = (

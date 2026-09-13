@@ -40,6 +40,14 @@ from xrpld_lab.ansible_builder import AnsibleBuilder
 from xrpld_lab.utils import write_file, save_config, write_executable
 
 
+def explorer_target(num_peers: int, port_offset: int = 0) -> tuple[str, int]:
+    """Node name and admin websocket port the explorer follows: pnode1, or vnode1
+    when the cluster has no peers."""
+    if num_peers > 0:
+        return "pnode1", PortSet.for_node(1, NodeRole.PEER, port_offset).ws_admin
+    return "vnode1", PortSet.for_node(1, NodeRole.VALIDATOR, port_offset).ws_admin
+
+
 class LabRunner:
     """Orchestrates standalone, network, and local network deployments."""
 
@@ -193,6 +201,7 @@ class LabRunner:
             network_id=lab.network_id,
             log_level=lab.log_level,
             node_db_type=lab.node_db_type,
+            vl_keys=[lab.public_vl_key] if lab.public_vl_key else None,
             datagram_monitor=[lab.datagram_monitor] if lab.datagram_monitor else None,
         )
 
@@ -526,7 +535,8 @@ class LabRunner:
 
         # 8. VL + explorer services
         compose.add_vl_service()
-        compose.add_explorer_service(ws_port=6016, standalone=False)
+        _, ws_port = explorer_target(lab.num_peers)
+        compose.add_explorer_service(ws_port=ws_port, standalone=False)
         compose.write(os.path.join(cluster_dir, "docker-compose.yml"))
 
         # 9. Sign UNL and write VL artifacts
@@ -793,14 +803,20 @@ class LabRunner:
         # 7. Docker compose for Docker-only services (VL + Explorer)
         compose = ComposeBuilder(f"{name}-network")
         compose.add_vl_service()
-        compose.add_explorer_service(ws_port=6016, standalone=False)
+        ws_node, ws_port = explorer_target(lab.num_peers, lab.port_offset)
+        compose.add_explorer_service(ws_port=ws_port, standalone=False)
         compose.write(os.path.join(cluster_dir, "docker-compose.yml"))
 
         # 8. Native start/stop scripts
         write_executable(
             os.path.join(cluster_dir, "start.sh"),
             ScriptBuilder.local_network_start(
-                name, lab.num_validators, lab.num_peers, lab.binary_name
+                name,
+                lab.num_validators,
+                lab.num_peers,
+                lab.binary_name,
+                ws_node=ws_node,
+                ws_port=ws_port,
             ),
         )
         write_executable(
