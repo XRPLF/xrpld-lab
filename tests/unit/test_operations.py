@@ -578,14 +578,12 @@ class TestExtractBinaryFromImage:
         assert docker.argvs[-1] == ["docker", "rm", "-f", probe]
 
     @patch("xrpld_lab.operations.subprocess.run", side_effect=FileNotFoundError)
-    def test_missing_docker_is_reported_then_cleanup_raises(
-        self, mock_run, tmp_path, capsys
-    ):
-        with pytest.raises(FileNotFoundError):
-            _extract_binary_from_image(self.IMAGE, str(tmp_path / "xrpld.3.4.0"))
+    def test_missing_docker_is_reported(self, mock_run, tmp_path, capsys):
+        ok = _extract_binary_from_image(self.IMAGE, str(tmp_path / "xrpld.3.4.0"))
 
+        assert ok is False
         assert "docker not found" in capsys.readouterr().out
-        assert mock_run.call_args.args[0] == ["docker", "rm", "-f", self._probe()]
+        assert mock_run.call_count == 1
 
 
 class TestDownloadBinary:
