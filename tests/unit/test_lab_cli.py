@@ -475,6 +475,43 @@ class TestBuildLabConfigStandalone:
 
     # -- github owner/repo from spec --
 
+    # -- --commit: an all-amendments "supported" image published by CI --
+
+    def test_commit_release_version_maps_to_the_version_tag(self):
+        cfg = build_lab_config(self._parse("--commit", "3.2.0"))
+        assert cfg.build_source.image == "ghcr.io/xrplf/xrpld/supported:3.2.0"
+        assert cfg.build_source.build_version == "3.2.0"
+        assert cfg.build_source.commit_hash == "3.2.0"
+        assert cfg.build_source.build_type == BuildType.IMAGE
+        assert cfg.build_source.build_server is None
+
+    def test_commit_v_prefixed_version_drops_the_v_from_the_tag(self):
+        cfg = build_lab_config(self._parse("--commit", "v3.2.0"))
+        assert cfg.build_source.image == "ghcr.io/xrplf/xrpld/supported:3.2.0"
+        assert cfg.build_source.build_version == "v3.2.0"
+        assert cfg.build_source.commit_hash == "v3.2.0"
+
+    def test_commit_sha_maps_to_the_short_sha_tag(self):
+        sha = "0123456789abcdef0123456789abcdef01234567"
+        cfg = build_lab_config(self._parse("--commit", sha))
+        assert cfg.build_source.image == "ghcr.io/xrplf/xrpld/supported:sha-0123456"
+        assert cfg.build_source.build_version == sha
+        assert cfg.build_source.commit_hash == sha
+
+    def test_commit_ignores_server_and_version(self):
+        cfg = build_lab_config(
+            self._parse("--commit", "3.2.0", "--server", "rippleci", "--version", "9")
+        )
+        assert cfg.build_source.image == "ghcr.io/xrplf/xrpld/supported:3.2.0"
+        assert cfg.build_source.build_version == "3.2.0"
+        assert cfg.build_source.build_server == "rippleci"
+
+    def test_config_overrides_file_is_loaded(self, tmp_path):
+        overrides = tmp_path / "overrides.yaml"
+        overrides.write_text("server:\n  port_ws_admin_local: 6010\n")
+        cfg = build_lab_config(self._parse("--config_overrides", str(overrides)))
+        assert cfg.config_overrides == {"server": {"port_ws_admin_local": 6010}}
+
     def test_xrpl_owner_repo(self):
         args = self._parse("--protocol", "xrpl")
         cfg = build_lab_config(args)
@@ -487,12 +524,32 @@ class TestBuildLabConfigStandalone:
 # -------------------------------------------------------------------------
 
 
+class TestBuildLabConfigOtherCommands:
+    """Only up:standalone, create:network and create:ansible build a LabConfig."""
+
+    @pytest.mark.parametrize("command", ["up:local", "logs:standalone"])
+    def test_operational_command_is_rejected(self, command):
+        args = _build_parser().parse_args([command])
+        with pytest.raises(ValueError) as exc:
+            build_lab_config(args)
+        assert str(exc.value) == f"Cannot build LabConfig for command: {command!r}"
+
+
 class TestBuildLabConfigNetwork:
     """Test build_lab_config for the create:network command."""
 
     def _parse(self, *extra_args):
         parser = _build_parser()
         return parser.parse_args(["create:network", *extra_args])
+
+    def test_config_overrides_file_is_loaded(self, tmp_path):
+        overrides = tmp_path / "overrides.json"
+        overrides.write_text('{"rpc_startup": {"command": "log_level"}}')
+        cfg = build_lab_config(self._parse("--config_overrides", str(overrides)))
+        assert cfg.config_overrides == {"rpc_startup": {"command": "log_level"}}
+
+    def test_config_overrides_default_is_empty(self):
+        assert build_lab_config(self._parse()).config_overrides == {}
 
     # -- deploy mode --
 
@@ -829,6 +886,41 @@ class TestBuildLabConfigAnsible:
                 *extra_args,
             ]
         )
+
+    def test_cluster_flag_names_the_workspace_dir(self):
+        cfg = build_lab_config(self._parse("--cluster", "perf-candidate"))
+        assert cfg.build_source.cluster_name == "perf-candidate"
+
+    def test_cluster_flag_overrides_the_branch_derived_name(self):
+        cfg = build_lab_config(
+            self._parse(
+                "--build_server",
+                "https://github.com/XRPLF/rippled/tree/feature/x",
+                "--cluster",
+                "perf-candidate",
+            )
+        )
+        assert cfg.build_source.cluster_name == "perf-candidate"
+
+    def test_without_ip_lists_or_config_file_exits(self):
+        args = _build_parser().parse_args(["create:ansible"])
+        with pytest.raises(SystemExit) as exc:
+            build_lab_config(args)
+        assert exc.value.code == (
+            "error: create:ansible requires --vips and --pips "
+            "(or --ansible_config with vips/pips in the YAML file)"
+        )
+
+    @pytest.mark.parametrize(
+        "argv",
+        [["--vips", "10.0.0.1"], ["--pips", "10.0.0.3"]],
+        ids=["vips-only", "pips-only"],
+    )
+    def test_one_ip_list_alone_exits(self, argv):
+        args = _build_parser().parse_args(["create:ansible", *argv])
+        with pytest.raises(SystemExit) as exc:
+            build_lab_config(args)
+        assert "requires --vips and --pips" in str(exc.value.code)
 
     def test_creates_ansible_config(self):
         args = self._parse()
@@ -1244,6 +1336,24 @@ class TestMain:
         assert mock_runner_cls.call_count == 1
         assert mock_runner_cls.call_args.args[0] is mock_config
         mock_runner.run.assert_called_once()
+        mock_start.assert_called_once_with(
+            os.path.join(str(tmp_path), "workspace", "xrpl-3.3.0")
+        )
+
+    @patch("xrpld_lab.cli.run_start_script", return_value=False)
+    @patch("xrpld_lab.cli.LabRunner")
+    @patch("xrpld_lab.cli.build_lab_config")
+    def test_up_standalone_failing_start_exits_1(
+        self, mock_build, mock_runner_cls, mock_start, tmp_path
+    ):
+        mock_build.return_value = MagicMock()
+        mock_runner_cls.return_value.run.return_value = "xrpl-3.3.0"
+
+        with patch("sys.argv", ["xrpld-lab", "up:standalone", "--protocol", "xrpl"]):
+            with pytest.raises(SystemExit) as exc:
+                main()
+
+        assert exc.value.code == 1
         mock_start.assert_called_once_with(
             os.path.join(str(tmp_path), "workspace", "xrpl-3.3.0")
         )
@@ -1682,6 +1792,54 @@ class TestMain:
             mock_run.return_value = MagicMock(returncode=0)
             main()
 
+        mock_run.assert_called_once_with(
+            ["bash", str(ansible_dir / "run.sh")], cwd=str(ansible_dir)
+        )
+
+    def test_deploy_ansible_without_run_sh_exits_1(self, tmp_path, capsys):
+        cluster_dir = tmp_path / "workspace" / "3.3.0-cluster"
+        cluster_dir.mkdir(parents=True)
+
+        with (
+            patch("xrpld_lab.cli.subprocess.run") as mock_run,
+            patch(
+                "sys.argv", ["xrpld-lab", "deploy:ansible", "--name", "3.3.0-cluster"]
+            ),
+        ):
+            with pytest.raises(SystemExit) as exc:
+                main()
+
+        assert exc.value.code == 1
+        mock_run.assert_not_called()
+        out = capsys.readouterr().out
+        assert f"No ansible deployment found at {cluster_dir / 'ansible'}" in out
+        assert (
+            "Run 'xrpld-lab create:ansible' first to generate deployment files." in out
+        )
+
+    def test_deploy_ansible_runs_when_stdio_cannot_be_made_blocking(self, tmp_path):
+        ansible_dir = tmp_path / "workspace" / "3.3.0-cluster" / "ansible"
+        ansible_dir.mkdir(parents=True)
+        (ansible_dir / "run.sh").write_text("#!/bin/bash\n")
+
+        with (
+            patch("xrpld_lab.cli.subprocess.run") as mock_run,
+            patch(
+                "xrpld_lab.cli.os.set_blocking",
+                side_effect=OSError(9, "Bad file descriptor"),
+            ) as mock_blocking,
+            patch(
+                "sys.argv", ["xrpld-lab", "deploy:ansible", "--name", "3.3.0-cluster"]
+            ),
+        ):
+            mock_run.return_value = MagicMock(returncode=0)
+            assert main() is None
+
+        assert [c.args for c in mock_blocking.call_args_list] == [
+            (0, True),
+            (1, True),
+            (2, True),
+        ]
         mock_run.assert_called_once_with(
             ["bash", str(ansible_dir / "run.sh")], cwd=str(ansible_dir)
         )

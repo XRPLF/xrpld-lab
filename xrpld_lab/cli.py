@@ -66,8 +66,6 @@ _DEFAULT_VL_KEY: str = (
 
 def _parse_bool(value: str) -> bool:
     """argparse type for boolean values: 1/true/yes and 0/false/no (any case)."""
-    if isinstance(value, bool):
-        return value
     lowered = value.strip().lower()
     if lowered in ("1", "true", "yes", "y"):
         return True

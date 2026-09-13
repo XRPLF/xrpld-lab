@@ -92,6 +92,15 @@ class TestRunCommand:
         kwargs = mock_run.call_args.kwargs
         assert kwargs == {"cwd": str(tmp_path)}
 
+    def test_os_error_other_than_missing_command_returns_127(self, tmp_path, capsys):
+        with patch(
+            "xrpld_lab.utils.subprocess.run",
+            side_effect=OSError(8, "Exec format error"),
+        ):
+            assert run_command(str(tmp_path), "./xrpld --conf x.cfg") == 127
+
+        assert "OS error: [Errno 8] Exec format error" in capsys.readouterr().out
+
 
 class TestRemoveDirectory:
     def test_removes_and_returns_true(self, tmp_path):
@@ -105,6 +114,33 @@ class TestRemoveDirectory:
     def test_missing_returns_false(self, tmp_path, capsys):
         assert remove_directory(str(tmp_path / "missing")) is False
         assert "Not found" in capsys.readouterr().out
+
+    def test_permission_denied_returns_false(self, tmp_path, capsys):
+        target = tmp_path / "net"
+        target.mkdir()
+
+        with patch(
+            "xrpld_lab.utils.shutil.rmtree",
+            side_effect=PermissionError(13, "Permission denied"),
+        ):
+            assert remove_directory(str(target)) is False
+
+        assert f"Permission denied: {target}" in capsys.readouterr().out
+        assert target.is_dir()
+
+    def test_other_os_error_returns_false(self, tmp_path, capsys):
+        target = tmp_path / "net"
+        target.mkdir()
+
+        with patch(
+            "xrpld_lab.utils.shutil.rmtree",
+            side_effect=OSError(66, "Directory not empty"),
+        ):
+            assert remove_directory(str(target)) is False
+
+        out = capsys.readouterr().out
+        assert "Error: [Errno 66] Directory not empty" in out
+        assert "removed" not in out
 
 
 class TestSaveConfig:
