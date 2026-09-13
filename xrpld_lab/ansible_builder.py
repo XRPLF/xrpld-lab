@@ -467,6 +467,8 @@ class AnsibleBuilder:
             '  ansible-playbook -i hosts.txt "${playbook}" "$@"',
             "}",
             "",
+            "# Stop at the first failed playbook so a partial deploy never reports success.",
+            "set -e",
             "export ANSIBLE_HOST_KEY_CHECKING=False",
             "",
             "# SSH agent — optional: skip when SSH_PATH is unset (key already agent-",
