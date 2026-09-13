@@ -467,7 +467,7 @@ class AnsibleBuilder:
             '  ansible-playbook -i hosts.txt "${playbook}" "$@"',
             "}",
             "",
-            "# Stop at the first failed playbook; a partial deploy must not report success.",
+            "# Stop at the first failed playbook; never report a partial deploy done.",
             "set -e",
             "export ANSIBLE_HOST_KEY_CHECKING=False",
             "",
