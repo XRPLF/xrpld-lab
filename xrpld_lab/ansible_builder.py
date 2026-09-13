@@ -382,6 +382,7 @@ class AnsibleBuilder:
             "              }\n"
             "              location = /status/ {\n"
             "                  limit_req zone=xrpld_status burst=40 nodelay;\n"
+            "                  add_header Cache-Control \"no-cache\";\n"
             f"                  root {self.STATUS_DIR}/www;\n"
             "                  try_files /network-dashboard.html =404;\n"
             "              }\n"
