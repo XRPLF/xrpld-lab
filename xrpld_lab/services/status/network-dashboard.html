@@ -61,7 +61,8 @@
   td.mono { font-family: var(--mono); overflow-wrap: anywhere; }
   .wrap { overflow-x: auto; }
   .copy { cursor: pointer; border: 1px solid var(--line); background: var(--panel-2); color: var(--text);
-          font-family: var(--mono); font-size: 12px; padding: 3px 8px; border-radius: 6px; overflow-wrap: anywhere; }
+          font-family: var(--mono); font-size: 12px; padding: 3px 8px; border-radius: 6px; white-space: nowrap;
+          display: inline-block; max-width: 100%; overflow-x: auto; vertical-align: middle; }
   .copy:hover { border-color: var(--accent); }
   .copy.done { border-color: var(--ok); }
   .empty { color: var(--dim); font-family: var(--mono); font-size: 12px; }
@@ -98,7 +99,7 @@
   <section id="sec-deployed">
     <h2>What is deployed <span class="who">for contributors whose branches ship here</span></h2>
     <div class="cards">
-      <div class="panel"><h3>Build</h3><table id="deploy"></table></div>
+      <div class="panel" style="grid-column: 1 / -1"><h3>Build</h3><div class="wrap"><table id="deploy"></table></div></div>
       <div class="panel" id="integrations" style="grid-column: 1 / -1; display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); background: none; border: 0; padding: 0;"></div>
     </div>
   </section>

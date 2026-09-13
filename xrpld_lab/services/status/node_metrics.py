@@ -660,6 +660,7 @@ def table_for(window_s, cfg):
 
 # ------------------------------------------------------------------ network roll-up
 # Health per role: a validator must be proposing, everything else must be full.
+LEDGER_SECONDS = 3
 HEALTHY_STATE = {"validator": "proposing", "peer": "full"}
 
 
@@ -714,6 +715,7 @@ class Network:
             "server_state": latest.get("server_state"),
             "build_version": latest.get("build_version"),
             "validated_ledger": latest.get("validated_seq"),
+            "sampled_at": latest.get("ts"),
             "peers": latest.get("peers"),
             "uptime": latest.get("uptime"),
             "ok": error is None and latest.get("xrpld_ok") == 1,
@@ -739,9 +741,11 @@ class Network:
             nodes = list(pool.map(lambda n: self._node(*n), self.nodes))
         validators = [n for n in nodes if n["role"] == "validator"]
         seqs = [n["validated_ledger"] for n in validators]
-        # Samplers are polled a few seconds apart, so one ledger of lag is normal;
-        # two or more validators further apart than that have diverged.
-        agreement = bool(validators) and None not in seqs and max(seqs) - min(seqs) <= 1
+        stamps = [n["sampled_at"] for n in validators if n["sampled_at"] is not None]
+        # Each sampler reads its node on its own tick, so the samples differ in age; a ledger
+        # closes about every LEDGER_SECONDS, so that age spread explains that many ledgers plus one.
+        allowed = 1 + (max(stamps) - min(stamps)) // LEDGER_SECONDS if stamps else 1
+        agreement = bool(validators) and None not in seqs and max(seqs) - min(seqs) <= allowed
         return {
             "name": self.name,
             "nodes": nodes,
