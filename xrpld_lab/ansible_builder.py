@@ -260,7 +260,7 @@ class AnsibleBuilder:
         alloy_dir = os.path.join(self.ansible_dir, "alloy")
         if os.path.isdir(alloy_dir):
             shutil.rmtree(alloy_dir)
-        shutil.copytree(a.source_dir, alloy_dir)
+        shutil.copytree(a.source_dir, alloy_dir, ignore=shutil.ignore_patterns(".git"))
         self._file_write(os.path.join(self.ansible_dir, "alloy.yml"), _ALLOY_YML)
 
     # ------------------------------------------------------------------
@@ -938,10 +938,12 @@ _ALLOY_YML = """---
   remote_user: root
 
   tasks:
-  - name: Copy the Alloy build context to the remote server
-    copy:
+  - name: Sync the Alloy build context to the remote server
+    synchronize:
       src: alloy/
       dest: /opt/xrpl-monitoring/
+      delete: yes
+      rsync_opts: ["--exclude=.git"]
   - name: Build the Alloy image (the Dockerfile needs BuildKit, which docker_image cannot use)
     command: docker build -q -f docker/alloy.Dockerfile -t "{{ alloy_image }}" .
     args:
