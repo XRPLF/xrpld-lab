@@ -69,6 +69,9 @@
   .cols { columns: 220px; column-gap: 24px; }
   .cols div { break-inside: avoid; padding: 2px 0; font-family: var(--mono); font-size: 12px; display: flex; gap: 6px; align-items: center; }
   .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex: none; }
+  .blocks { display: inline-flex; gap: 2px; vertical-align: middle; }
+  .blocks span { width: 6px; height: 16px; border-radius: 1px; background: var(--line); }
+  .blocks .ok { background: var(--ok); } .blocks .warn { background: var(--warn); } .blocks .bad { background: var(--bad); }
   .dot.ok { background: var(--ok); } .dot.warn { background: var(--warn); }
   input[type=search] { background: var(--panel-2); border: 1px solid var(--line); color: var(--text);
     border-radius: 6px; padding: 5px 9px; font: 13px var(--sans); width: 240px; max-width: 100%; }
@@ -274,21 +277,51 @@ setInterval(() => { const el = document.getElementById('stat-close'); if (el) el
 // names. "Behind" is the gap to the newest index any validator has validated.
 let validatorNames = {};
 const validations = {};  // key -> { index, hash, full, at }
-const hashesByIndex = new Map();  // index -> Map(key -> hash), last 64 indexes
+const BLOCKS = 40;  // ledgers shown per validator
+const hashesByIndex = new Map();  // index -> Map(key -> {hash, at}), last BLOCKS indexes
+const validatedAt = new Map();    // index -> when the network validated it (ledgerClosed seen)
 function onValidation(m) {
   const key = m.master_key || m.validation_public_key;
   const index = Number(m.ledger_index);
   if (!key || !Number.isFinite(index)) return;
-  validations[key] = { index, hash: m.ledger_hash, full: m.full !== false, at: Date.now(), ephemeral: m.validation_public_key };
+  const at = Date.now();
+  validations[key] = { index, hash: m.ledger_hash, full: m.full !== false, at, ephemeral: m.validation_public_key };
   if (!hashesByIndex.has(index)) hashesByIndex.set(index, new Map());
-  hashesByIndex.get(index).set(key, m.ledger_hash);
-  for (const k of hashesByIndex.keys()) if (k < index - 64) hashesByIndex.delete(k);
+  hashesByIndex.get(index).set(key, { hash: m.ledger_hash, at });
+  for (const k of hashesByIndex.keys()) if (k < index - BLOCKS) hashesByIndex.delete(k);
   renderValidations();
 }
 function majorityHash(index) {
   const counts = {};
-  for (const h of (hashesByIndex.get(index) || new Map()).values()) counts[h] = (counts[h] || 0) + 1;
+  for (const v of (hashesByIndex.get(index) || new Map()).values()) counts[v.hash] = (counts[v.hash] || 0) + 1;
   return Object.entries(counts).sort((a, b) => b[1] - a[1])[0]?.[0];
+}
+// One block per ledger: green when this validator's validation carried the majority hash and
+// arrived before the network validated that ledger (it was part of the quorum); amber when it
+// arrived within LATE_MS after; red when later, missing or a different hash; unfilled while
+// the ledger is still open.
+const LATE_MS = 1000;
+function blocks(key, top) {
+  const out = [];
+  for (let i = top - BLOCKS + 1; i <= top; i++) {
+    const v = (hashesByIndex.get(i) || new Map()).get(key), done = validatedAt.get(i);
+    let cls = '', note = v ? '' : ': no validation';
+    if (v && v.hash !== majorityHash(i)) { cls = 'bad'; note = ': different hash'; }
+    else if (v && (!done || v.at <= done)) cls = 'ok';
+    else if (v && done) { const late = v.at - done; cls = late <= LATE_MS ? 'warn' : 'bad'; note = `: +${late} ms after quorum`; }
+    else if (done) cls = 'bad';
+    out.push(`<span class="${cls}" title="ledger ${i}${note}"></span>`);
+  }
+  return `<span class="blocks">${out.join('')}</span>`;
+}
+// Median arrival time of this validator's validations relative to the network validating each
+// ledger, over the visible window: negative means it was part of the quorum.
+function lagMs(key) {
+  const d = [];
+  for (const [i, m] of hashesByIndex) { const v = m.get(key), done = validatedAt.get(i); if (v && done) d.push(v.at - done); }
+  if (!d.length) return null;
+  d.sort((a, b) => a - b);
+  return d[Math.floor(d.length / 2)];
 }
 // A validator counts as agreeing when its latest validation carries the majority hash for that
 // index and is at most one ledger behind the newest index seen (one validation is always in flight).
@@ -308,14 +341,15 @@ function renderValidations() {
   const known = Object.entries(validatorNames).filter(([k]) => !validations[k]).map(([k, name]) => ({ key: k, name, silent: true }));
   const rows = keys.map(k => ({ key: k, name: validatorNames[k], ...validations[k] })).concat(known)
     .sort((a, b) => (a.name || a.key).localeCompare(b.name || b.key));
-  el.innerHTML = `<tr><th>Validator</th><th>Key</th><th style="text-align:right">Last validated</th><th>Hash</th><th style="text-align:right">Behind</th><th style="text-align:right">Age</th><th>Status</th></tr>` +
+  el.innerHTML = `<tr><th>Validator</th><th>Key</th><th>Last ${BLOCKS} ledgers</th><th style="text-align:right">Lag</th><th style="text-align:right">Last validated</th><th>Hash</th><th style="text-align:right">Behind</th><th style="text-align:right">Age</th><th>Status</th></tr>` +
     rows.map(r => {
-      if (r.silent) return `<tr><td>${esc(r.name)}</td><td class="mono">${esc(r.key.slice(0, 12))}…</td><td class="num">–</td><td>–</td><td class="num">–</td><td class="num">–</td><td>${badge('warn', 'no validations seen')}</td></tr>`;
+      if (r.silent) return `<tr><td>${esc(r.name)}</td><td class="mono">${esc(r.key.slice(0, 12))}…</td><td>${blocks(r.key, top)}</td><td class="num">–</td><td class="num">–</td><td>–</td><td class="num">–</td><td class="num">–</td><td>${badge('warn', 'no validations seen')}</td></tr>`;
       const behind = top - r.index, age = Math.round((Date.now() - r.at) / 1000);
       const majority = majorityHash(r.index), forked = majority && r.hash !== majority;
       const status = forked ? badge('bad', 'different hash') : !r.full ? badge('warn', 'partial') : age > 30 ? badge('bad', 'silent') :
         behind > 1 || age > 12 ? badge('warn', 'behind') : badge('ok', 'validating');
-      return `<tr><td>${r.name ? esc(r.name) : '<span class="empty">unknown</span>'}</td><td class="mono">${esc(r.key.slice(0, 12))}…</td>` +
+      return `<tr><td>${r.name ? esc(r.name) : '<span class="empty">unknown</span>'}</td><td class="mono">${esc(r.key.slice(0, 12))}…</td><td>${blocks(r.key, top)}</td>` +
+        `<td class="num">${(() => { const l = lagMs(r.key); return l == null ? '–' : `${l > 0 ? '+' : ''}${l} ms`; })()}</td>` +
         `<td class="num">${fmtNum(r.index)}</td><td class="mono">${esc((r.hash || '').slice(0, 12))}</td>` +
         `<td class="num">${behind === 0 ? '<span class="empty">current</span>' : behind}</td><td class="num">${age}s</td><td>${status}</td></tr>`;
     }).join('');
@@ -350,6 +384,9 @@ function connectLedgerStream(endpoint) {
       if (m.type === 'ledgerClosed') {
         chain.txns = ledger.txn_count;
         chain.closedAt = ledger.ledger_time != null ? RIPPLE_EPOCH_MS + ledger.ledger_time * 1000 : Date.now();
+        validatedAt.set(ledger.ledger_index, Date.now());
+        for (const k of validatedAt.keys()) if (k < ledger.ledger_index - BLOCKS) validatedAt.delete(k);
+        renderValidations();
       }
       renderStats();
     };
