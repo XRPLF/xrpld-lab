@@ -540,7 +540,7 @@ class TestExtractBinaryFromImage:
         assert ok is False
         assert f"Cannot pull image {self.IMAGE}" in capsys.readouterr().out
         assert not os.path.exists(dest)
-        assert [a[1] for a in docker.argvs] == ["rm", "create", "pull", "rm"]
+        assert [a[1] for a in docker.argvs] == ["rm", "create", "pull"]
 
     def test_failed_create_after_pull_is_reported(self, tmp_path, capsys):
         stderr = (
@@ -558,7 +558,7 @@ class TestExtractBinaryFromImage:
             "manifest unknown"
         ) in capsys.readouterr().out
         assert not os.path.exists(dest)
-        assert [a[1] for a in docker.argvs] == ["rm", "create", "pull", "create", "rm"]
+        assert [a[1] for a in docker.argvs] == ["rm", "create", "pull", "create"]
 
     def test_no_binary_at_any_known_path_is_reported(self, tmp_path, capsys):
         docker = _FakeDocker(create_codes=[0], present=())
