@@ -416,10 +416,11 @@ def test_main_up_standalone_renders_then_starts(tmp_path, monkeypatch):
         cli.main()
 
     run_start_script.assert_called_once()
-    workspace, name = run_start_script.call_args.args
-    assert name == "xrpl-3.3.0"
-    assert os.path.realpath(workspace.base) == os.path.realpath(tmp_path / "workspace")
-    assert os.path.isfile(os.path.join(workspace.base, name, "start.sh"))
+    (net_dir,) = run_start_script.call_args.args
+    assert os.path.realpath(net_dir) == os.path.realpath(
+        tmp_path / "workspace" / "xrpl-3.3.0"
+    )
+    assert os.path.isfile(os.path.join(net_dir, "start.sh"))
 
 
 class TestConfigOverrides:

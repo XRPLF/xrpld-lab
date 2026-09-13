@@ -39,6 +39,7 @@ def check_consensus(
     timeout_s: int = 300,
     interval_s: int = 10,
     rpc_timeout_s: float = 5.0,
+    port_offset: int = 0,
     *,
     fetch: Callable[[str, float], tuple[str | None, int]] = _server_state,
     clock: Callable[[], float] = time.monotonic,
@@ -50,6 +51,7 @@ def check_consensus(
         vips: validator external IPs, in node order (node i → PortSet i).
         timeout_s: overall deadline.
         interval_s: seconds between polling rounds.
+        port_offset: the ``--port_offset`` the cluster was created with.
         fetch: ``(url, rpc_timeout_s) -> (server_state, validated_seq)``.
         clock: monotonic seconds, read for the deadline.
         sleep: waits between polling rounds.
@@ -57,7 +59,11 @@ def check_consensus(
     Returns True once the whole set is healthy; False on timeout.
     """
     endpoints = [
-        (i + 1, f"http://{ip}:{PortSet.for_node(i + 1, NodeRole.VALIDATOR).rpc_public}")
+        (
+            i + 1,
+            f"http://{ip}:"
+            f"{PortSet.for_node(i + 1, NodeRole.VALIDATOR, port_offset).rpc_public}",
+        )
         for i, ip in enumerate(vips)
     ]
     deadline = clock() + timeout_s

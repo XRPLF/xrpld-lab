@@ -116,7 +116,7 @@ xrpld-lab create:ansible \
 |---|---|---|
 | `--vips` | required | Validator IP addresses |
 | `--pips` | required | Peer IP addresses |
-| `--ssh_port` | `20` | SSH port for ansible |
+| `--ssh_port` | `22` | SSH port for ansible |
 | `--ssh_user` | `ubuntu` | SSH user |
 | `--ssh_key` | `~/.ssh/id_rsa` | SSH private key path |
 | `--ansible_config` | none | YAML file with full ansible config (services, etc.) |
@@ -194,18 +194,48 @@ by deleting `.done_<host>_nginx`.
 ### `deploy:ansible` -- Run ansible deployment
 
 ```bash
-xrpld-lab deploy:ansible --name <cluster>
+xrpld-lab deploy:ansible --name <cluster> [--workspace <dir>]
 ```
 
 Runs the generated `run.sh` in the cluster's ansible directory.
 
+| Option | Default | Description |
+|---|---|---|
+| `--name` | required | Cluster name, as `<name>` or `<name>-cluster` |
+| `--workspace` | `./workspace` | Workspace root holding the cluster directory |
+
 ### Operational commands
 
+Every command below addresses a cluster directory under `--workspace` (default
+`./workspace`) by `--name`, given either as `<name>` or as the full directory name
+`<name>-cluster`; both resolve to the same directory. Commands that reach a node over
+its admin or public RPC take `--port_offset`, the value the cluster was created with.
+
 ```bash
-xrpld-lab up --name <network>      # Start a network
-xrpld-lab down --name <network>    # Stop a network
-xrpld-lab remove --name <network>  # Remove a network
+xrpld-lab up --name <cluster>                          # Start a network
+xrpld-lab down --name <cluster>                        # Stop a network
+xrpld-lab remove --name <cluster>                      # Stop with --remove and delete the directory
+xrpld-lab update:node --name <cluster> --node_id <N> --node_type validator|peer \
+  --build_version <version> (--build_server <url> | --image <image>)
+xrpld-lab vote:amendment --name <cluster> --amendment_name <name> [--node_id <N>]
+xrpld-lab node:stall --name <cluster> --node_id <N> --node_type validator|peer \
+  [--duration_ms <ms> | --clear]
+xrpld-lab node:restart --name <cluster> <node_dir> [--genesis]   # e.g. vnode2
+xrpld-lab logs:local [--name <cluster>] [--node <node_dir>]
+xrpld-lab health --vips <ip>... [--timeout <s>] [--interval <s>]
 ```
+
+| Option | Default | Description |
+|---|---|---|
+| `--name` | required | Cluster name, as `<name>` or `<name>-cluster`; optional on `logs:local`, which reads the current directory without it |
+| `--workspace` | `./workspace` | Workspace root holding the cluster directory (every command above except `health`) |
+| `--port_offset` | `0` | The `--port_offset` the cluster was created with (`node:stall`, `vote:amendment`, `health`) |
+| `--node_id` | required | Node index (`update:node`, `node:stall`; one validator instead of all on `vote:amendment`) |
+| `--node_type` | required | `validator` or `peer` (`update:node`, `node:stall`) |
+| `--duration_ms` | `30000` | `node:stall`: stall length in ms; `--clear` lifts a stall early |
+| `--genesis` | off | `node:restart`: reload the genesis ledger instead of resuming from the node's database |
+| `--vips` | required | `health`: validator external IPs, in node order |
+| `--timeout` / `--interval` | `300` / `10` | `health`: overall deadline and seconds between polls |
 
 ## Config overrides
 

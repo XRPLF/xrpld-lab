@@ -10,6 +10,7 @@ Covers:
 """
 
 import argparse
+import os
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -257,7 +258,7 @@ class TestBuildParser:
         assert args.ansible is True
         assert args.vips == ["10.0.0.1", "10.0.0.2"]
         assert args.pips == ["10.0.0.3"]
-        assert args.ssh_port == 20
+        assert args.ssh_port == 22
         assert args.ssh_user == "ubuntu"
 
     def test_create_ansible_defaults(self):
@@ -297,6 +298,63 @@ class TestBuildParser:
         args = parser.parse_args(["deploy:ansible", "--name", "my-cluster"])
         assert args.command == "deploy:ansible"
         assert args.name == "my-cluster"
+
+    def test_node_stall_args(self):
+        args = _build_parser().parse_args(
+            ["node:stall", "--name", "n", "--node_id", "2", "--node_type", "peer"]
+        )
+        assert args.name == "n"
+        assert args.node_id == 2
+        assert args.node_type == "peer"
+        assert args.duration_ms == 30000
+        assert args.clear is False
+        assert args.port_offset == 0
+
+    def test_node_restart_requires_a_cluster_name(self):
+        args = _build_parser().parse_args(["node:restart", "--name", "n", "vnode2"])
+        assert args.name == "n"
+        assert args.node_name == "vnode2"
+        assert args.genesis is False
+        with pytest.raises(SystemExit):
+            _build_parser().parse_args(["node:restart", "vnode2"])
+
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ["node:stall", "--name", "n", "--node_id", "1", "--node_type", "peer"],
+            ["vote:amendment", "--name", "n", "--amendment_name", "x"],
+            ["health", "--vips", "10.0.0.1"],
+        ],
+    )
+    def test_port_offset_on_node_addressing_commands(self, argv):
+        assert _build_parser().parse_args(argv).port_offset == 0
+        assert (
+            _build_parser().parse_args(argv + ["--port_offset", "1000"]).port_offset
+            == 1000
+        )
+
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            [
+                "update:node",
+                "--name",
+                "n",
+                "--node_id",
+                "1",
+                "--node_type",
+                "peer",
+                "--build_version",
+                "1",
+                "--image",
+                "i",
+            ],
+            ["node:restart", "--name", "n", "vnode1"],
+        ],
+    )
+    def test_no_port_offset_where_no_port_is_used(self, argv):
+        with pytest.raises(SystemExit):
+            _build_parser().parse_args(argv + ["--port_offset", "1000"])
 
     def test_all_subcommands_present(self):
         """The parser registers exactly the documented subcommands."""
@@ -1150,8 +1208,17 @@ class TestBuildLabConfigAnsible:
 # -------------------------------------------------------------------------
 
 
+def _cluster_path(tmp_path, name: str) -> str:
+    """Where main() resolves --name <name> under the default ./workspace root."""
+    return os.path.join(str(tmp_path), "workspace", f"{name}-cluster")
+
+
 class TestMain:
-    """Test main() dispatches correctly."""
+    """Test main() dispatches correctly.
+
+    Every cluster-addressing command resolves ``--name`` through
+    ``Workspace.resolve_cluster`` and hands the directory to its operation.
+    """
 
     @pytest.fixture(autouse=True)
     def _run_in_tmp_dir(self, tmp_path, monkeypatch):
@@ -1161,7 +1228,9 @@ class TestMain:
     @patch("xrpld_lab.cli.run_start_script")
     @patch("xrpld_lab.cli.LabRunner")
     @patch("xrpld_lab.cli.build_lab_config")
-    def test_up_standalone_calls_runner(self, mock_build, mock_runner_cls, mock_start):
+    def test_up_standalone_calls_runner(
+        self, mock_build, mock_runner_cls, mock_start, tmp_path
+    ):
         mock_config = MagicMock()
         mock_build.return_value = mock_config
         mock_runner = MagicMock()
@@ -1175,8 +1244,9 @@ class TestMain:
         assert mock_runner_cls.call_count == 1
         assert mock_runner_cls.call_args.args[0] is mock_config
         mock_runner.run.assert_called_once()
-        mock_start.assert_called_once()
-        assert mock_start.call_args.args[1] == "xrpl-3.3.0"
+        mock_start.assert_called_once_with(
+            os.path.join(str(tmp_path), "workspace", "xrpl-3.3.0")
+        )
 
     @patch("xrpld_lab.cli.run_start_script")
     @patch("xrpld_lab.cli.LabRunner")
@@ -1224,37 +1294,42 @@ class TestMain:
     # -- Operational command dispatch tests --
 
     @patch("xrpld_lab.cli.run_start_script")
-    @patch("xrpld_lab.cli.Workspace")
-    def test_up_dispatches_to_run_start_script(self, mock_ws_cls, mock_run):
-        mock_ws = MagicMock()
-        mock_ws_cls.return_value = mock_ws
-
+    def test_up_dispatches_to_run_start_script(self, mock_run, tmp_path):
         with patch("sys.argv", ["xrpld-lab", "up", "--name", "my-net"]):
             main()
 
-        mock_run.assert_called_once_with(mock_ws, "my-net")
+        mock_run.assert_called_once_with(_cluster_path(tmp_path, "my-net"))
+
+    @patch("xrpld_lab.cli.run_start_script")
+    def test_up_with_the_full_directory_name(self, mock_run, tmp_path):
+        with patch("sys.argv", ["xrpld-lab", "up", "--name", "3.3.0-cluster"]):
+            main()
+
+        mock_run.assert_called_once_with(_cluster_path(tmp_path, "3.3.0"))
+
+    @patch("xrpld_lab.cli.run_start_script")
+    def test_up_with_workspace(self, mock_run, tmp_path):
+        base = str(tmp_path / "srv" / "ws")
+        with patch(
+            "sys.argv", ["xrpld-lab", "up", "--name", "my-net", "--workspace", base]
+        ):
+            main()
+
+        mock_run.assert_called_once_with(os.path.join(base, "my-net-cluster"))
 
     @patch("xrpld_lab.cli.run_stop_script")
-    @patch("xrpld_lab.cli.Workspace")
-    def test_down_dispatches_to_run_stop_script(self, mock_ws_cls, mock_run):
-        mock_ws = MagicMock()
-        mock_ws_cls.return_value = mock_ws
-
+    def test_down_dispatches_to_run_stop_script(self, mock_run, tmp_path):
         with patch("sys.argv", ["xrpld-lab", "down", "--name", "my-net"]):
             main()
 
-        mock_run.assert_called_once_with(mock_ws, "my-net")
+        mock_run.assert_called_once_with(_cluster_path(tmp_path, "my-net"))
 
     @patch("xrpld_lab.cli.remove_network")
-    @patch("xrpld_lab.cli.Workspace")
-    def test_remove_dispatches_to_remove_network(self, mock_ws_cls, mock_run):
-        mock_ws = MagicMock()
-        mock_ws_cls.return_value = mock_ws
-
+    def test_remove_dispatches_to_remove_network(self, mock_run, tmp_path):
         with patch("sys.argv", ["xrpld-lab", "remove", "--name", "my-net"]):
             main()
 
-        mock_run.assert_called_once_with(mock_ws, "my-net")
+        mock_run.assert_called_once_with(_cluster_path(tmp_path, "my-net"))
 
     @patch("xrpld_lab.cli.stop_standalone")
     @patch("xrpld_lab.cli.Workspace")
@@ -1329,11 +1404,7 @@ class TestMain:
         mock_run.assert_called_once()
 
     @patch("xrpld_lab.cli.update_node_binary")
-    @patch("xrpld_lab.cli.Workspace")
-    def test_update_node_dispatches(self, mock_ws_cls, mock_run):
-        mock_ws = MagicMock()
-        mock_ws_cls.return_value = mock_ws
-
+    def test_update_node_dispatches(self, mock_run, tmp_path):
         with patch(
             "sys.argv",
             [
@@ -1354,8 +1425,7 @@ class TestMain:
             main()
 
         mock_run.assert_called_once_with(
-            mock_ws,
-            "my-net",
+            _cluster_path(tmp_path, "my-net"),
             2,
             "validator",
             "https://build.example.com",
@@ -1364,11 +1434,8 @@ class TestMain:
         )
 
     @patch("xrpld_lab.cli.update_node_binary")
-    @patch("xrpld_lab.cli.Workspace")
-    def test_update_node_from_image_dispatches(self, mock_ws_cls, mock_run):
-        mock_ws = MagicMock()
-        mock_ws_cls.return_value = mock_ws
-
+    def test_update_node_from_image_dispatches(self, mock_run, tmp_path):
+        base = str(tmp_path / "ws")
         with patch(
             "sys.argv",
             [
@@ -1384,13 +1451,14 @@ class TestMain:
                 "3.3.0-rc1",
                 "--image",
                 "rippleci/xrpld:3.3.0-rc1",
+                "--workspace",
+                base,
             ],
         ):
             main()
 
         mock_run.assert_called_once_with(
-            mock_ws,
-            "my-net",
+            os.path.join(base, "my-net-cluster"),
             2,
             "validator",
             None,
@@ -1399,10 +1467,7 @@ class TestMain:
         )
 
     @patch("xrpld_lab.cli.vote_amendment")
-    @patch("xrpld_lab.cli.Workspace")
-    def test_vote_amendment_dispatches(self, mock_ws_cls, mock_run):
-        mock_ws = MagicMock()
-        mock_ws_cls.return_value = mock_ws
+    def test_vote_amendment_dispatches(self, mock_run, tmp_path):
         mock_run.return_value = True
 
         with patch(
@@ -1416,29 +1481,141 @@ class TestMain:
                 "fixNFTokenRemint",
                 "--node_id",
                 "1",
+                "--port_offset",
+                "1000",
             ],
         ):
             main()
 
         mock_run.assert_called_once_with(
-            "my-net", "fixNFTokenRemint", mock_ws, node_id=1
+            _cluster_path(tmp_path, "my-net"),
+            "fixNFTokenRemint",
+            node_id=1,
+            port_offset=1000,
         )
 
-    @patch("xrpld_lab.cli.view_local_logs")
-    @patch("xrpld_lab.cli.Workspace")
-    def test_logs_local_dispatches(self, mock_ws_cls, mock_run):
-        with patch("sys.argv", ["xrpld-lab", "logs:local", "--node", "vnode1"]):
+    @patch("xrpld_lab.cli.node_stall")
+    def test_node_stall_dispatches(self, mock_run, tmp_path):
+        mock_run.return_value = True
+        base = str(tmp_path / "ws")
+
+        with patch(
+            "sys.argv",
+            [
+                "xrpld-lab",
+                "node:stall",
+                "--name",
+                "my-net",
+                "--node_id",
+                "2",
+                "--node_type",
+                "peer",
+                "--duration_ms",
+                "5000",
+                "--workspace",
+                base,
+                "--port_offset",
+                "1000",
+            ],
+        ):
             main()
 
-        mock_run.assert_called_once_with("vnode1")
+        mock_run.assert_called_once_with(
+            os.path.join(base, "my-net-cluster"),
+            2,
+            "peer",
+            5000,
+            False,
+            port_offset=1000,
+        )
+
+    @patch("xrpld_lab.cli.node_stall", return_value=True)
+    def test_node_stall_clear_dispatches(self, mock_run, tmp_path):
+        with patch(
+            "sys.argv",
+            [
+                "xrpld-lab",
+                "node:stall",
+                "--name",
+                "my-net",
+                "--node_id",
+                "1",
+                "--node_type",
+                "validator",
+                "--clear",
+            ],
+        ):
+            main()
+
+        mock_run.assert_called_once_with(
+            _cluster_path(tmp_path, "my-net"),
+            1,
+            "validator",
+            30000,
+            True,
+            port_offset=0,
+        )
+
+    @patch("xrpld_lab.cli.restart_local_node", return_value=True)
+    def test_node_restart_dispatches(self, mock_restart, tmp_path):
+        with patch(
+            "sys.argv",
+            ["xrpld-lab", "node:restart", "--name", "my-net", "vnode2", "--genesis"],
+        ):
+            main()
+
+        mock_restart.assert_called_once_with(
+            _cluster_path(tmp_path, "my-net"), "vnode2", genesis=True
+        )
+
+    @patch("xrpld_lab.health.check_consensus", return_value=True)
+    def test_health_dispatches_with_port_offset(self, mock_check):
+        with patch(
+            "sys.argv",
+            [
+                "xrpld-lab",
+                "health",
+                "--vips",
+                "10.0.0.1",
+                "10.0.0.2",
+                "--timeout",
+                "60",
+                "--port_offset",
+                "1000",
+            ],
+        ):
+            main()
+
+        mock_check.assert_called_once_with(
+            ["10.0.0.1", "10.0.0.2"], timeout_s=60, interval_s=10, port_offset=1000
+        )
+
+    @patch("xrpld_lab.health.check_consensus", return_value=False)
+    def test_failing_health_exits_1(self, mock_check):
+        with patch("sys.argv", ["xrpld-lab", "health", "--vips", "10.0.0.1"]):
+            with pytest.raises(SystemExit) as exc:
+                main()
+
+        assert exc.value.code == 1
 
     @patch("xrpld_lab.cli.view_local_logs")
-    @patch("xrpld_lab.cli.Workspace")
-    def test_logs_local_no_node(self, mock_ws_cls, mock_run):
+    def test_logs_local_dispatches(self, mock_run, tmp_path):
+        with patch(
+            "sys.argv",
+            ["xrpld-lab", "logs:local", "--name", "my-net", "--node", "vnode1"],
+        ):
+            main()
+
+        mock_run.assert_called_once_with(_cluster_path(tmp_path, "my-net"), "vnode1")
+
+    @patch("xrpld_lab.cli.view_local_logs")
+    def test_logs_local_without_a_name_reads_the_current_directory(
+        self, mock_run, tmp_path
+    ):
         with patch("sys.argv", ["xrpld-lab", "logs:local"]):
             main()
 
-        mock_run.assert_called_once_with(None)
+        mock_run.assert_called_once_with(str(tmp_path), None)
 
     @patch("xrpld_lab.cli.view_standalone_logs")
     @patch("xrpld_lab.cli.Workspace")
@@ -1476,15 +1653,38 @@ class TestMain:
         mock_runner.run.assert_called_once()
 
     @patch("xrpld_lab.cli._deploy_ansible")
-    @patch("xrpld_lab.cli.Workspace")
-    def test_deploy_ansible_dispatches(self, mock_ws_cls, mock_deploy):
-        mock_ws = MagicMock()
-        mock_ws_cls.return_value = mock_ws
-
-        with patch("sys.argv", ["xrpld-lab", "deploy:ansible", "--name", "my-cluster"]):
+    def test_deploy_ansible_dispatches(self, mock_deploy, tmp_path):
+        with patch("sys.argv", ["xrpld-lab", "deploy:ansible", "--name", "3.3.0"]):
             main()
 
-        mock_deploy.assert_called_once_with(mock_ws, "my-cluster")
+        mock_deploy.assert_called_once_with(_cluster_path(tmp_path, "3.3.0"))
+
+    @patch("xrpld_lab.cli._deploy_ansible")
+    def test_deploy_ansible_with_the_full_directory_name(self, mock_deploy, tmp_path):
+        with patch(
+            "sys.argv", ["xrpld-lab", "deploy:ansible", "--name", "3.3.0-cluster"]
+        ):
+            main()
+
+        mock_deploy.assert_called_once_with(_cluster_path(tmp_path, "3.3.0"))
+
+    def test_deploy_ansible_runs_the_generated_run_sh(self, tmp_path):
+        ansible_dir = tmp_path / "workspace" / "3.3.0-cluster" / "ansible"
+        ansible_dir.mkdir(parents=True)
+        (ansible_dir / "run.sh").write_text("#!/bin/bash\n")
+
+        with (
+            patch("xrpld_lab.cli.subprocess.run") as mock_run,
+            patch(
+                "sys.argv", ["xrpld-lab", "deploy:ansible", "--name", "3.3.0-cluster"]
+            ),
+        ):
+            mock_run.return_value = MagicMock(returncode=0)
+            main()
+
+        mock_run.assert_called_once_with(
+            ["bash", str(ansible_dir / "run.sh")], cwd=str(ansible_dir)
+        )
 
     # -- Exit status: a failed operation exits 1, a successful one returns --
 
@@ -1550,9 +1750,10 @@ class TestMain:
         assert exc.value.code == 1
 
     @patch("xrpld_lab.cli.restart_local_node", return_value=False)
-    @patch("xrpld_lab.cli.Workspace")
-    def test_failing_node_restart_exits_1(self, mock_ws_cls, mock_restart):
-        with patch("sys.argv", ["xrpld-lab", "node:restart", "vnode1"]):
+    def test_failing_node_restart_exits_1(self, mock_restart):
+        with patch(
+            "sys.argv", ["xrpld-lab", "node:restart", "--name", "my-net", "vnode1"]
+        ):
             with pytest.raises(SystemExit) as exc:
                 main()
 
@@ -1693,6 +1894,39 @@ class TestWorkspaceOverride:
             ["deploy:ansible", "--name", "alphanet", "--workspace", "/srv/ws"]
         )
         assert args.workspace == "/srv/ws"
+
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ["up", "--name", "n"],
+            ["down", "--name", "n"],
+            ["remove", "--name", "n"],
+            ["deploy:ansible", "--name", "n"],
+            [
+                "update:node",
+                "--name",
+                "n",
+                "--node_id",
+                "1",
+                "--node_type",
+                "peer",
+                "--build_version",
+                "1",
+                "--image",
+                "i",
+            ],
+            ["vote:amendment", "--name", "n", "--amendment_name", "x"],
+            ["node:stall", "--name", "n", "--node_id", "1", "--node_type", "peer"],
+            ["node:restart", "--name", "n", "vnode1"],
+            ["logs:local"],
+        ],
+    )
+    def test_parsed_on_every_cluster_addressing_command(self, argv):
+        assert _build_parser().parse_args(argv).workspace is None
+        assert (
+            _build_parser().parse_args(argv + ["--workspace", "/srv/ws"]).workspace
+            == "/srv/ws"
+        )
 
     @patch("xrpld_lab.cli.LabRunner")
     @patch("xrpld_lab.cli.build_lab_config")

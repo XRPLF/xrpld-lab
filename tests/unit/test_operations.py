@@ -10,8 +10,12 @@ Covers:
 - start_local / stop_local: CWD-based script running
 - update_node_binary: binary sourcing before stop, Dockerfile rewrite, exit codes
 - restart_local_node: docker vs bare-process relaunch and pidfile
-- vote_amendment / node_stall: JSON-RPC dispatch and error reporting
+- _admin_rpc_port / vote_amendment / node_stall: port offset, JSON-RPC dispatch
+  and error reporting
 - view_local_logs / view_standalone_logs: log file discovery
+
+Every cluster-addressing helper takes the resolved cluster directory; the CLI
+resolves ``--name`` through ``Workspace.resolve_cluster``.
 """
 
 import json
@@ -24,6 +28,7 @@ import requests
 
 from xrpld_lab.models import NodeRole, PortSet
 from xrpld_lab.operations import (
+    _admin_rpc_port,
     _dockerfile_with_binary,
     vote_amendment,
     node_stall,
@@ -48,6 +53,15 @@ def _workspace(base: str) -> MagicMock:
     return ws
 
 
+def _cluster(tmp_path, *nodes: str) -> str:
+    """Create ``<tmp_path>/my-net/<node>`` for every node; the cluster directory."""
+    cluster = tmp_path / "my-net"
+    cluster.mkdir(exist_ok=True)
+    for node in nodes:
+        (cluster / node).mkdir()
+    return str(cluster)
+
+
 # -------------------------------------------------------------------------
 # run_start_script / run_stop_script
 # -------------------------------------------------------------------------
@@ -59,36 +73,36 @@ class TestRunScripts:
     @patch("xrpld_lab.operations.run_command", return_value=0)
     @patch("os.path.isfile", return_value=True)
     def test_run_start_script_calls_bash(self, mock_isfile, mock_run):
-        assert run_start_script(_workspace("/workspace"), "my-net") is True
+        assert run_start_script("/workspace/my-net") is True
         mock_run.assert_called_once_with("/workspace/my-net", "bash start.sh")
 
     @patch("xrpld_lab.operations.run_command", return_value=7)
     @patch("os.path.isfile", return_value=True)
     def test_run_start_script_reports_failure(self, mock_isfile, mock_run):
-        assert run_start_script(_workspace("/workspace"), "my-net") is False
+        assert run_start_script("/workspace/my-net") is False
 
     @patch("xrpld_lab.operations.run_command")
     @patch("os.path.isfile", return_value=False)
     def test_run_start_script_missing_prints_error(self, mock_isfile, mock_run, capsys):
-        assert run_start_script(_workspace("/workspace"), "my-net") is False
+        assert run_start_script("/workspace/my-net") is False
         mock_run.assert_not_called()
         assert "start.sh not found" in capsys.readouterr().out
 
     @patch("xrpld_lab.operations.run_command", return_value=0)
     @patch("os.path.isfile", return_value=True)
     def test_run_stop_script_calls_bash(self, mock_isfile, mock_run):
-        assert run_stop_script(_workspace("/workspace"), "my-net") is True
+        assert run_stop_script("/workspace/my-net") is True
         mock_run.assert_called_once_with("/workspace/my-net", "bash stop.sh")
 
     @patch("xrpld_lab.operations.run_command", return_value=1)
     @patch("os.path.isfile", return_value=True)
     def test_run_stop_script_reports_failure(self, mock_isfile, mock_run):
-        assert run_stop_script(_workspace("/workspace"), "my-net") is False
+        assert run_stop_script("/workspace/my-net") is False
 
     @patch("xrpld_lab.operations.run_command")
     @patch("os.path.isfile", return_value=False)
     def test_run_stop_script_missing_prints_error(self, mock_isfile, mock_run, capsys):
-        assert run_stop_script(_workspace("/workspace"), "my-net") is False
+        assert run_stop_script("/workspace/my-net") is False
         mock_run.assert_not_called()
         assert "stop.sh not found" in capsys.readouterr().out
 
@@ -107,7 +121,7 @@ class TestRemoveNetwork:
         net.mkdir()
         (net / "stop.sh").write_text("#!/bin/bash\n")
 
-        assert remove_network(_workspace(str(tmp_path)), "my-net") is True
+        assert remove_network(str(tmp_path / "my-net")) is True
 
         mock_run.assert_called_once_with(str(net), "bash stop.sh --remove")
         assert not net.exists()
@@ -118,7 +132,7 @@ class TestRemoveNetwork:
         net.mkdir()
         (net / "stop.sh").write_text("#!/bin/bash\n")
 
-        assert remove_network(_workspace(str(tmp_path)), "my-net") is False
+        assert remove_network(str(tmp_path / "my-net")) is False
 
         assert net.is_dir()
         assert (net / "stop.sh").is_file()
@@ -128,13 +142,13 @@ class TestRemoveNetwork:
     def test_directory_without_stop_script_is_removed(self, mock_run, tmp_path):
         (tmp_path / "my-net").mkdir()
 
-        assert remove_network(_workspace(str(tmp_path)), "my-net") is True
+        assert remove_network(str(tmp_path / "my-net")) is True
 
         mock_run.assert_not_called()
         assert not (tmp_path / "my-net").exists()
 
     def test_missing_directory_prints_error(self, tmp_path, capsys):
-        assert remove_network(_workspace(str(tmp_path)), "my-net") is False
+        assert remove_network(str(tmp_path / "my-net")) is False
         assert "not found" in capsys.readouterr().out
 
 
@@ -425,7 +439,7 @@ class TestUpdateNodeBinary:
         net_dir = str(tmp_path / "my-net")
 
         ok = update_node_binary(
-            _workspace(str(tmp_path)), "my-net", 2, "validator", "https://b", "3.4.0"
+            str(tmp_path / "my-net"), 2, "validator", "https://b", "3.4.0"
         )
 
         assert ok is True
@@ -452,7 +466,7 @@ class TestUpdateNodeBinary:
         )
 
         ok = update_node_binary(
-            _workspace(str(tmp_path)), "my-net", 2, "validator", "https://b", "3.4.0"
+            str(tmp_path / "my-net"), 2, "validator", "https://b", "3.4.0"
         )
 
         assert ok is True
@@ -469,8 +483,7 @@ class TestUpdateNodeBinary:
         node_dir = self._cluster(tmp_path, "vnode2", dockerfile)
 
         ok = update_node_binary(
-            _workspace(str(tmp_path)),
-            "my-net",
+            str(tmp_path / "my-net"),
             2,
             "validator",
             None,
@@ -492,7 +505,7 @@ class TestUpdateNodeBinary:
         self._cluster(tmp_path, "vnode2", _network_dockerfile(binary=False))
 
         ok = update_node_binary(
-            _workspace(str(tmp_path)), "my-net", 2, "validator", "https://b", "3.4.0"
+            str(tmp_path / "my-net"), 2, "validator", "https://b", "3.4.0"
         )
 
         assert ok is False
@@ -512,7 +525,7 @@ class TestUpdateNodeBinary:
         mock_subproc.side_effect = fake_curl
 
         ok = update_node_binary(
-            _workspace(str(tmp_path)), "my-net", 2, "validator", "https://b", "3.4.0"
+            str(tmp_path / "my-net"), 2, "validator", "https://b", "3.4.0"
         )
 
         assert ok is True
@@ -536,8 +549,7 @@ class TestUpdateNodeBinary:
 
         with patch("xrpld_lab.operations._download_binary") as mock_dl:
             ok = update_node_binary(
-                _workspace(str(tmp_path)),
-                "my-net",
+                str(tmp_path / "my-net"),
                 2,
                 "validator",
                 None,
@@ -564,7 +576,7 @@ class TestUpdateNodeBinary:
         self._cluster(tmp_path, "pnode3", _network_dockerfile(binary=False))
 
         ok = update_node_binary(
-            _workspace(str(tmp_path)), "my-net", 3, "peer", "https://b", "1.0.0"
+            str(tmp_path / "my-net"), 3, "peer", "https://b", "1.0.0"
         )
 
         assert ok is True
@@ -579,7 +591,7 @@ class TestUpdateNodeBinary:
         self._cluster(tmp_path, "vnode2", _network_dockerfile(binary=False))
 
         ok = update_node_binary(
-            _workspace(str(tmp_path)), "my-net", 2, "validator", "https://b", "3.4.0"
+            str(tmp_path / "my-net"), 2, "validator", "https://b", "3.4.0"
         )
 
         assert ok is False
@@ -596,7 +608,7 @@ class TestUpdateNodeBinary:
         self._cluster(tmp_path, "vnode2", _network_dockerfile(binary=False))
 
         ok = update_node_binary(
-            _workspace(str(tmp_path)), "my-net", 2, "validator", "https://b", "3.4.0"
+            str(tmp_path / "my-net"), 2, "validator", "https://b", "3.4.0"
         )
 
         assert ok is False
@@ -611,7 +623,7 @@ class TestUpdateNodeBinary:
         self._cluster(tmp_path, "vnode2", "FROM scratch\n")
 
         ok = update_node_binary(
-            _workspace(str(tmp_path)), "my-net", 2, "validator", "https://b", "3.4.0"
+            str(tmp_path / "my-net"), 2, "validator", "https://b", "3.4.0"
         )
 
         assert ok is False
@@ -620,7 +632,7 @@ class TestUpdateNodeBinary:
     @patch("xrpld_lab.operations.run_command")
     def test_update_missing_node_dir(self, mock_run, tmp_path, capsys):
         ok = update_node_binary(
-            _workspace(str(tmp_path)), "my-net", 1, "peer", "https://b", "1.0.0"
+            str(tmp_path / "my-net"), 1, "peer", "https://b", "1.0.0"
         )
 
         assert ok is False
@@ -632,7 +644,7 @@ class TestUpdateNodeBinary:
         (tmp_path / "my-net" / "vnode1").mkdir(parents=True)
 
         ok = update_node_binary(
-            _workspace(str(tmp_path)), "my-net", 1, "validator", "https://b", "1.0.0"
+            str(tmp_path / "my-net"), 1, "validator", "https://b", "1.0.0"
         )
 
         assert ok is False
@@ -650,37 +662,32 @@ class TestRestartLocalNode:
 
     @patch("xrpld_lab.operations.run_command", return_value=0)
     @patch("xrpld_lab.operations._docker_container_exists", return_value=True)
-    @patch("os.getcwd", return_value="/cluster")
     @patch("os.path.isdir", return_value=True)
     @patch("os.path.isfile", return_value=False)
-    def test_docker_resume(
-        self, mock_isfile, mock_isdir, mock_cwd, mock_docker, mock_run
-    ):
-        assert restart_local_node("vnode2") is True
-        mock_run.assert_called_once_with("/cluster", "docker restart vnode2")
+    def test_docker_resume(self, mock_isfile, mock_isdir, mock_docker, mock_run):
+        assert restart_local_node("/ws/my-net-cluster", "vnode2") is True
+        mock_run.assert_called_once_with("/ws/my-net-cluster", "docker restart vnode2")
 
     @patch("xrpld_lab.operations.run_command", return_value=0)
     @patch("xrpld_lab.operations._docker_container_exists", return_value=True)
-    @patch("os.getcwd", return_value="/cluster")
     @patch("os.path.isdir", return_value=True)
     @patch("os.path.isfile", return_value=False)
     def test_docker_genesis_recreates(
-        self, mock_isfile, mock_isdir, mock_cwd, mock_docker, mock_run
+        self, mock_isfile, mock_isdir, mock_docker, mock_run
     ):
-        assert restart_local_node("vnode5", genesis=True) is True
+        assert restart_local_node("/ws/my-net-cluster", "vnode5", genesis=True) is True
         mock_run.assert_called_once_with(
-            "/cluster", "docker compose up --force-recreate -d vnode5"
+            "/ws/my-net-cluster", "docker compose up --force-recreate -d vnode5"
         )
 
     @patch("xrpld_lab.operations.run_command", return_value=1)
     @patch("xrpld_lab.operations._docker_container_exists", return_value=True)
-    @patch("os.getcwd", return_value="/cluster")
     @patch("os.path.isdir", return_value=True)
     @patch("os.path.isfile", return_value=False)
     def test_docker_failure_is_reported(
-        self, mock_isfile, mock_isdir, mock_cwd, mock_docker, mock_run, capsys
+        self, mock_isfile, mock_isdir, mock_docker, mock_run, capsys
     ):
-        assert restart_local_node("vnode2") is False
+        assert restart_local_node("/ws/my-net-cluster", "vnode2") is False
         assert "restarted" not in capsys.readouterr().out
 
     @staticmethod
@@ -699,8 +706,7 @@ class TestRestartLocalNode:
         node_dir = self._bare_node(tmp_path, "vnode1")
         mock_popen.return_value = MagicMock(pid=4242)
 
-        with patch("os.getcwd", return_value=str(tmp_path)):
-            ok = restart_local_node("vnode1")
+        ok = restart_local_node(str(tmp_path), "vnode1")
 
         assert ok is True
         assert mock_run.call_args_list[0].args[0] == ["kill", "12345"]
@@ -722,8 +728,9 @@ class TestRestartLocalNode:
         self._bare_node(tmp_path, "vnode1")
         mock_popen.return_value = MagicMock(pid=4242)
 
-        with patch("os.getcwd", return_value=str(tmp_path)):
-            assert restart_local_node("vnode1", binary_name="rippled", genesis=True)
+        assert restart_local_node(
+            str(tmp_path), "vnode1", binary_name="rippled", genesis=True
+        )
 
         assert mock_popen.call_args.args[0] == [
             "./rippled",
@@ -745,8 +752,7 @@ class TestRestartLocalNode:
     ):
         node_dir = self._bare_node(tmp_path, "vnode1")
 
-        with patch("os.getcwd", return_value=str(tmp_path)):
-            ok = restart_local_node("vnode1")
+        ok = restart_local_node(str(tmp_path), "vnode1")
 
         assert ok is False
         assert not os.path.exists(os.path.join(node_dir, "xrpld.pid"))
@@ -755,11 +761,12 @@ class TestRestartLocalNode:
         assert "started" not in out
 
     @patch("xrpld_lab.operations.run_command")
-    @patch("os.path.isdir", return_value=False)
-    def test_missing_node_dir(self, mock_isdir, mock_run, capsys):
-        assert restart_local_node("vnode9") is False
+    def test_missing_node_dir(self, mock_run, tmp_path, capsys):
+        assert restart_local_node(str(tmp_path), "vnode9") is False
         mock_run.assert_not_called()
-        assert "not found" in capsys.readouterr().out
+        assert f"Node directory not found: {tmp_path / 'vnode9'}" in (
+            capsys.readouterr().out
+        )
 
 
 # -------------------------------------------------------------------------
@@ -776,21 +783,32 @@ def _rpc_response(status_code: int = 200, result: dict | None = None) -> MagicMo
     return resp
 
 
+class TestAdminRpcPort:
+    """The admin RPC port follows PortSet.for_node, shifted by the port offset."""
+
+    def test_validator_and_peer_without_offset(self):
+        assert _admin_rpc_port(1, "validator") == 5105
+        assert _admin_rpc_port(2, "peer") == 5025
+
+    def test_offset_shifts_the_port(self):
+        assert _admin_rpc_port(1, "validator", 1000) == 6105
+        assert (
+            _admin_rpc_port(3, "peer", 1000)
+            == PortSet.for_node(3, NodeRole.PEER, 1000).rpc_admin
+        )
+
+
 class TestVoteAmendment:
     """Veto lifting via the feature admin RPC across the cluster's validators."""
 
-    def _workspace(self, tmp_path, validators):
-        ws = MagicMock()
-        ws.base = str(tmp_path)
-        for i in range(1, validators + 1):
-            (tmp_path / "my-net" / f"vnode{i}").mkdir(parents=True)
-        return ws
+    def _cluster(self, tmp_path, validators):
+        return _cluster(tmp_path, *[f"vnode{i}" for i in range(1, validators + 1)])
 
     @patch("xrpld_lab.operations.requests.post")
     def test_every_validator_is_asked(self, mock_post, tmp_path, capsys):
         mock_post.return_value = _rpc_response()
 
-        ok = vote_amendment("my-net", "fixNFTokenRemint", self._workspace(tmp_path, 2))
+        ok = vote_amendment(self._cluster(tmp_path, 2), "fixNFTokenRemint")
 
         assert ok is True
         urls = [c.args[0] for c in mock_post.call_args_list]
@@ -804,7 +822,7 @@ class TestVoteAmendment:
     def test_node_id_targets_one_validator(self, mock_post, tmp_path):
         mock_post.return_value = _rpc_response()
 
-        vote_amendment("my-net", "X", self._workspace(tmp_path, 3), node_id=2)
+        vote_amendment(self._cluster(tmp_path, 3), "X", node_id=2)
 
         assert mock_post.call_count == 1
         assert mock_post.call_args.args[0] == "http://localhost:5205"
@@ -818,7 +836,7 @@ class TestVoteAmendment:
             hashlib.sha512("fixNFTokenRemint".encode("utf-8")).hexdigest().upper()[:64]
         )
 
-        vote_amendment("my-net", "fixNFTokenRemint", self._workspace(tmp_path, 1))
+        vote_amendment(self._cluster(tmp_path, 1), "fixNFTokenRemint")
 
         assert mock_post.call_args.kwargs["json"]["params"][0]["feature"] == expected
 
@@ -831,7 +849,7 @@ class TestVoteAmendment:
             result={h: {"name": "X", "vetoed": False, "enabled": False}}
         )
 
-        vote_amendment("my-net", "X", self._workspace(tmp_path, 1))
+        vote_amendment(self._cluster(tmp_path, 1), "X")
 
         assert "vnode1: X vetoed=False enabled=False" in capsys.readouterr().out
 
@@ -839,25 +857,33 @@ class TestVoteAmendment:
     def test_one_failing_validator_fails_the_command(self, mock_post, tmp_path, capsys):
         mock_post.side_effect = [_rpc_response(status_code=403), _rpc_response()]
 
-        ok = vote_amendment("my-net", "X", self._workspace(tmp_path, 2))
+        ok = vote_amendment(self._cluster(tmp_path, 2), "X")
 
         assert ok is False
         assert mock_post.call_count == 2
         assert "HTTP 403" in capsys.readouterr().out
 
-    def test_no_validators_is_a_failure(self, tmp_path, capsys):
-        ws = MagicMock()
-        ws.base = str(tmp_path)
+    @patch("xrpld_lab.operations.requests.post")
+    def test_port_offset_shifts_every_validator(self, mock_post, tmp_path):
+        mock_post.return_value = _rpc_response()
 
-        assert vote_amendment("missing", "X", ws) is False
-        assert "No validators found" in capsys.readouterr().out
+        vote_amendment(self._cluster(tmp_path, 2), "X", port_offset=1000)
+
+        urls = [c.args[0] for c in mock_post.call_args_list]
+        assert urls == ["http://localhost:6105", "http://localhost:6205"]
+
+    def test_no_validators_is_a_failure(self, tmp_path, capsys):
+        missing = str(tmp_path / "missing")
+
+        assert vote_amendment(missing, "X") is False
+        assert f"No validators found under {missing}" in capsys.readouterr().out
 
     @patch(
         "xrpld_lab.operations.requests.post",
         side_effect=requests.ConnectionError("refused"),
     )
     def test_unreachable_validator_is_a_failure(self, mock_post, tmp_path, capsys):
-        assert vote_amendment("my-net", "X", self._workspace(tmp_path, 1)) is False
+        assert vote_amendment(self._cluster(tmp_path, 1), "X") is False
         assert "RPC request failed" in capsys.readouterr().out
 
 
@@ -865,10 +891,10 @@ class TestNodeStall:
     """node_stall admin RPC dispatch."""
 
     @patch("xrpld_lab.operations.requests.post")
-    def test_stall_sends_duration(self, mock_post, capsys):
+    def test_stall_sends_duration(self, mock_post, tmp_path, capsys):
         mock_post.return_value = _rpc_response()
 
-        ok = node_stall("my-net", 1, "validator", MagicMock(), duration_ms=5000)
+        ok = node_stall(_cluster(tmp_path, "vnode1"), 1, "validator", duration_ms=5000)
 
         assert ok is True
         assert mock_post.call_args.args[0] == "http://localhost:5105"
@@ -881,10 +907,10 @@ class TestNodeStall:
         assert "node_stall RPC sent." in out
 
     @patch("xrpld_lab.operations.requests.post")
-    def test_clear_sends_clear(self, mock_post, capsys):
+    def test_clear_sends_clear(self, mock_post, tmp_path, capsys):
         mock_post.return_value = _rpc_response()
 
-        assert node_stall("my-net", 2, "peer", MagicMock(), clear=True) is True
+        assert node_stall(_cluster(tmp_path, "pnode2"), 2, "peer", clear=True) is True
 
         assert mock_post.call_args.args[0] == "http://localhost:5025"
         assert mock_post.call_args.kwargs["json"]["params"] == [{"clear": True}]
@@ -893,7 +919,7 @@ class TestNodeStall:
         )
 
     @patch("xrpld_lab.operations.requests.post")
-    def test_rpc_error_result_is_a_failure(self, mock_post, capsys):
+    def test_rpc_error_result_is_a_failure(self, mock_post, tmp_path, capsys):
         mock_post.return_value = _rpc_response(
             result={
                 "status": "error",
@@ -902,25 +928,44 @@ class TestNodeStall:
             }
         )
 
-        assert node_stall("my-net", 1, "validator", MagicMock()) is False
+        assert node_stall(_cluster(tmp_path, "vnode1"), 1, "validator") is False
         out = capsys.readouterr().out
         assert "Unknown method." in out
         assert "node_stall RPC sent" not in out
 
     @patch("xrpld_lab.operations.requests.post")
-    def test_default_duration_is_30s(self, mock_post):
+    def test_default_duration_is_30s(self, mock_post, tmp_path):
         mock_post.return_value = _rpc_response()
 
-        node_stall("my-net", 1, "validator", MagicMock())
+        node_stall(_cluster(tmp_path, "vnode1"), 1, "validator")
 
         assert mock_post.call_args.kwargs["json"]["params"] == [{"duration_ms": 30000}]
+
+    @patch("xrpld_lab.operations.requests.post")
+    def test_port_offset_shifts_the_admin_port(self, mock_post, tmp_path):
+        mock_post.return_value = _rpc_response()
+
+        node_stall(_cluster(tmp_path, "vnode1"), 1, "validator", port_offset=1000)
+
+        assert mock_post.call_args.args[0] == "http://localhost:6105"
+
+    @patch("xrpld_lab.operations.requests.post")
+    def test_missing_node_dir_sends_nothing(self, mock_post, tmp_path, capsys):
+        cluster = _cluster(tmp_path, "vnode1")
+
+        assert node_stall(cluster, 2, "validator") is False
+
+        mock_post.assert_not_called()
+        assert f"Node directory not found: {os.path.join(cluster, 'vnode2')}" in (
+            capsys.readouterr().out
+        )
 
     @patch(
         "xrpld_lab.operations.requests.post",
         side_effect=requests.ConnectionError("refused"),
     )
-    def test_unreachable_node_is_a_failure(self, mock_post, capsys):
-        assert node_stall("my-net", 1, "validator", MagicMock()) is False
+    def test_unreachable_node_is_a_failure(self, mock_post, tmp_path, capsys):
+        assert node_stall(_cluster(tmp_path, "vnode1"), 1, "validator") is False
         out = capsys.readouterr().out
         assert "RPC request failed: refused" in out
         assert "node_stall RPC sent" not in out
@@ -936,9 +981,8 @@ class TestLogs:
 
     @patch("subprocess.run")
     @patch("os.path.isfile", return_value=True)
-    @patch("os.getcwd", return_value="/my/project")
-    def test_view_local_logs_with_node(self, mock_cwd, mock_isfile, mock_run):
-        view_local_logs("vnode1")
+    def test_view_local_logs_with_node(self, mock_isfile, mock_run):
+        view_local_logs("/my/project", "vnode1")
         mock_run.assert_called_once()
         call_args = mock_run.call_args[0][0]
         assert "tail" in call_args
@@ -946,15 +990,14 @@ class TestLogs:
 
     @patch("subprocess.run")
     @patch("os.path.isfile", return_value=False)
-    @patch("os.getcwd", return_value="/my/project")
     @patch("glob.glob", return_value=[])
     def test_view_local_logs_no_file_prints_error(
-        self, mock_glob, mock_cwd, mock_isfile, mock_run, capsys
+        self, mock_glob, mock_isfile, mock_run, capsys
     ):
-        view_local_logs(None)
+        view_local_logs("/my/project", None)
         mock_run.assert_not_called()
-        captured = capsys.readouterr()
-        assert "No debug.log found" in captured.out
+        mock_glob.assert_called_once_with("/my/project/**/debug.log", recursive=True)
+        assert "No debug.log found for /my/project." in capsys.readouterr().out
 
     @patch("subprocess.run")
     def test_view_standalone_logs_tails_docker(self, mock_run):

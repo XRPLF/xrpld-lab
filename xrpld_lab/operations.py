@@ -32,32 +32,31 @@ from xrpld_lab.workspace import Workspace
 # ---------------------------------------------------------------------------
 
 
-def run_start_script(workspace: Workspace, name: str) -> bool:
-    """Run the start.sh script for a named network/cluster; True when it exits 0."""
-    script = os.path.join(workspace.base, name, "start.sh")
+def run_start_script(net_dir: str) -> bool:
+    """Run the start.sh script in a network/cluster directory; True when it exits 0."""
+    script = os.path.join(net_dir, "start.sh")
     if not os.path.isfile(script):
         print(f"{bcolors.RED}start.sh not found: {script}{bcolors.END}")
         return False
-    return run_command(os.path.join(workspace.base, name), "bash start.sh") == 0
+    return run_command(net_dir, "bash start.sh") == 0
 
 
-def run_stop_script(workspace: Workspace, name: str) -> bool:
-    """Run the stop.sh script for a named network/cluster; True when it exits 0."""
-    script = os.path.join(workspace.base, name, "stop.sh")
+def run_stop_script(net_dir: str) -> bool:
+    """Run the stop.sh script in a network/cluster directory; True when it exits 0."""
+    script = os.path.join(net_dir, "stop.sh")
     if not os.path.isfile(script):
         print(f"{bcolors.RED}stop.sh not found: {script}{bcolors.END}")
         return False
-    return run_command(os.path.join(workspace.base, name), "bash stop.sh") == 0
+    return run_command(net_dir, "bash stop.sh") == 0
 
 
-def remove_network(workspace: Workspace, name: str) -> bool:
+def remove_network(path: str) -> bool:
     """Stop a network with ``stop.sh --remove`` and delete its directory.
 
     The directory is removed only after the stop script exits 0, so a running
     cluster is never left without its compose file. A directory with no
     ``stop.sh`` (nothing was ever generated) is removed directly.
     """
-    path = os.path.join(workspace.base, name)
     if not os.path.isdir(path):
         print(f"{bcolors.RED}Directory not found: {path}{bcolors.END}")
         return False
@@ -268,11 +267,12 @@ def _docker_container_exists(name: str) -> bool:
 
 
 def restart_local_node(
+    cluster_dir: str,
     node_name: str,
     binary_name: str = "xrpld",
     genesis: bool = False,
 ) -> bool:
-    """Stop and restart a single local node; True when the node was relaunched.
+    """Stop and restart one node of the cluster in *cluster_dir*; True when relaunched.
 
     With ``genesis=False`` (default) the node resumes from its existing
     database — use this when restarting after a crash, stall, or attack
@@ -286,8 +286,7 @@ def restart_local_node(
     ``docker restart``\\s it (keeping its database layer), ``genesis=True``
     recreates it so the database is wiped and the entrypoint reloads genesis.
     """
-    cwd = os.getcwd()
-    node_dir = os.path.join(cwd, node_name)
+    node_dir = os.path.join(cluster_dir, node_name)
     if not os.path.isdir(node_dir):
         print(f"{bcolors.RED}Node directory not found: {node_dir}{bcolors.END}")
         return False
@@ -297,13 +296,13 @@ def restart_local_node(
         if genesis:
             print(f"{bcolors.CYAN}Recreating {node_name} from genesis...{bcolors.END}")
             code = run_command(
-                cwd, f"docker compose up --force-recreate -d {node_name}"
+                cluster_dir, f"docker compose up --force-recreate -d {node_name}"
             )
         else:
             print(
                 f"{bcolors.CYAN}Restarting {node_name} (resume from db)...{bcolors.END}"
             )
-            code = run_command(cwd, f"docker restart {node_name}")
+            code = run_command(cluster_dir, f"docker restart {node_name}")
         if code != 0:
             return False
         print(f"{bcolors.GREEN}{node_name} restarted.{bcolors.END}")
@@ -443,16 +442,20 @@ def _download_binary(url: str, dest: str) -> bool:
     return True
 
 
+def _node_dir_name(node_id: int, node_type: str) -> str:
+    """Node directory name: ``vnode<N>`` for a validator, ``pnode<N>`` for a peer."""
+    return f"vnode{node_id}" if node_type == "validator" else f"pnode{node_id}"
+
+
 def update_node_binary(
-    workspace: Workspace,
-    name: str,
+    net_dir: str,
     node_id: int,
     node_type: str,
     build_server: str | None,
     build_version: str,
     image: str = None,
 ) -> bool:
-    """Update the xrpld binary for a single node in a running network.
+    """Update the xrpld binary for a single node of the cluster in *net_dir*.
 
     Steps:
     1. Source the new binary into the node directory as ``xrpld.<build_version>``:
@@ -466,8 +469,7 @@ def update_node_binary(
 
     Returns True only when every step succeeded.
     """
-    node_dir_name = f"vnode{node_id}" if node_type == "validator" else f"pnode{node_id}"
-    net_dir = os.path.join(workspace.base, name)
+    node_dir_name = _node_dir_name(node_id, node_type)
     node_dir = os.path.join(net_dir, node_dir_name)
 
     if not os.path.isdir(node_dir):
@@ -535,10 +537,10 @@ def update_node_binary(
 # ---------------------------------------------------------------------------
 
 
-def _admin_rpc_port(node_id: int, node_type: str) -> int:
-    """RPC admin port for node *node_id* of *node_type*."""
+def _admin_rpc_port(node_id: int, node_type: str, port_offset: int = 0) -> int:
+    """RPC admin port for node *node_id* of *node_type*, shifted by *port_offset*."""
     role = NodeRole.VALIDATOR if node_type == "validator" else NodeRole.PEER
-    return PortSet.for_node(node_id, role).rpc_admin
+    return PortSet.for_node(node_id, role, port_offset).rpc_admin
 
 
 def _admin_rpc(url: str, method: str, params: dict) -> dict | None:
@@ -570,10 +572,10 @@ def _admin_rpc(url: str, method: str, params: dict) -> dict | None:
 # ---------------------------------------------------------------------------
 
 
-def _validator_ids(workspace: Workspace, name: str) -> list[int]:
+def _validator_ids(cluster_dir: str) -> list[int]:
     """Validator indexes in the cluster directory, from its vnode<N> subdirectories."""
     ids = []
-    for path in glob.glob(os.path.join(workspace.base, name, "vnode*")):
+    for path in glob.glob(os.path.join(cluster_dir, "vnode*")):
         suffix = os.path.basename(path)[len("vnode") :]
         if suffix.isdigit():
             ids.append(int(suffix))
@@ -581,10 +583,10 @@ def _validator_ids(workspace: Workspace, name: str) -> list[int]:
 
 
 def vote_amendment(
-    name: str,
+    cluster_dir: str,
     amendment_name: str,
-    workspace: Workspace,
     node_id: int | None = None,
+    port_offset: int = 0,
 ) -> bool:
     """Lift the veto on an amendment so the cluster's validators vote for it.
 
@@ -595,16 +597,13 @@ def vote_amendment(
     targeted validator accepted the command.
     """
     amendment_hash = sha512_half(amendment_name.encode("utf-8").hex())
-    ids = [node_id] if node_id is not None else _validator_ids(workspace, name)
+    ids = [node_id] if node_id is not None else _validator_ids(cluster_dir)
     if not ids:
-        print(
-            f"{bcolors.RED}No validators found under "
-            f"{os.path.join(workspace.base, name)}{bcolors.END}"
-        )
+        print(f"{bcolors.RED}No validators found under {cluster_dir}{bcolors.END}")
         return False
     ok = True
     for i in ids:
-        url = f"http://localhost:{_admin_rpc_port(i, 'validator')}"
+        url = f"http://localhost:{_admin_rpc_port(i, 'validator', port_offset)}"
         result = _admin_rpc(
             url, "feature", {"feature": amendment_hash, "vetoed": False}
         )
@@ -629,22 +628,27 @@ def vote_amendment(
 
 
 def node_stall(
-    name: str,
+    cluster_dir: str,
     node_id: int,
     node_type: str,
-    workspace: Workspace,
     duration_ms: int = 30000,
     clear: bool = False,
+    port_offset: int = 0,
 ) -> bool:
     """Stall or unstall a running node via the ``node_stall`` admin RPC.
 
-    When stalled, the node stops participating in consensus (no proposals,
-    no validations, no ledger closes).  After *duration_ms* the node
-    automatically resumes.  Pass ``clear=True`` to lift the stall early.
-    Returns True when the node reports success.
+    The node must have its directory under *cluster_dir*. When stalled, the
+    node stops participating in consensus (no proposals, no validations, no
+    ledger closes).  After *duration_ms* the node automatically resumes.
+    Pass ``clear=True`` to lift the stall early. Returns True when the node
+    reports success.
     """
+    node_dir = os.path.join(cluster_dir, _node_dir_name(node_id, node_type))
+    if not os.path.isdir(node_dir):
+        print(f"{bcolors.RED}Node directory not found: {node_dir}{bcolors.END}")
+        return False
     params = {"clear": True} if clear else {"duration_ms": duration_ms}
-    url = f"http://localhost:{_admin_rpc_port(node_id, node_type)}"
+    url = f"http://localhost:{_admin_rpc_port(node_id, node_type, port_offset)}"
     action = "Clearing stall on" if clear else f"Stalling ({duration_ms}ms)"
     print(f"{bcolors.CYAN}{action} {node_type} {node_id} at {url}...{bcolors.END}")
     if _admin_rpc(url, "node_stall", params) is None:
@@ -658,21 +662,19 @@ def node_stall(
 # ---------------------------------------------------------------------------
 
 
-def view_local_logs(node: str | None) -> None:
-    """Tail local node log files.
+def view_local_logs(net_dir: str, node: str | None) -> None:
+    """Tail node log files under *net_dir*.
 
     If *node* is given (e.g. ``"vnode1"``), look for its ``log/debug.log``.
-    Otherwise search the current directory for any ``debug.log`` files.
+    Otherwise search *net_dir* for any ``debug.log`` files.
     """
-    cwd = os.getcwd()
-
     if node:
         candidates = [
-            os.path.join(cwd, node, "log", "debug.log"),
-            os.path.join(cwd, node, "config", "debug.log"),
+            os.path.join(net_dir, node, "log", "debug.log"),
+            os.path.join(net_dir, node, "config", "debug.log"),
         ]
     else:
-        candidates = glob.glob(os.path.join(cwd, "**/debug.log"), recursive=True)
+        candidates = glob.glob(os.path.join(net_dir, "**/debug.log"), recursive=True)
 
     log_file = None
     for path in candidates:
@@ -681,7 +683,7 @@ def view_local_logs(node: str | None) -> None:
             break
 
     if not log_file:
-        search = node or "current directory"
+        search = node or net_dir
         print(f"{bcolors.RED}No debug.log found for {search}.{bcolors.END}")
         return
 

@@ -20,6 +20,21 @@ class Workspace:
         """Path of a network cluster directory, without creating it."""
         return os.path.join(self.base, f"{name}-cluster")
 
+    def resolve_cluster(self, name: str) -> str:
+        """Path of the cluster directory addressed as ``X`` or ``X-cluster``.
+
+        ``-cluster`` is appended at most once and nothing is created. When
+        ``X`` itself is an existing directory and ``X-cluster`` is not, ``X``
+        is returned; otherwise the ``-cluster`` form is.
+        """
+        as_given = os.path.join(self.base, name)
+        if name.endswith("-cluster"):
+            return as_given
+        with_suffix = self.cluster_path(name)
+        if os.path.isdir(as_given) and not os.path.isdir(with_suffix):
+            return as_given
+        return with_suffix
+
     def standalone_path(self, protocol: str, name: str) -> str:
         """Path of a standalone directory, without creating it."""
         return os.path.join(self.base, f"{protocol}-{name}")
