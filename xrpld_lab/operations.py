@@ -366,6 +366,7 @@ def _extract_binary_from_image(image: str, dest: str) -> bool:
     image layouts, so each known location is tried. Returns True on success.
     """
     probe = f"xrpld-extract-{os.getpid()}"
+    created = False
     try:
         subprocess.run(["docker", "rm", "-f", probe], capture_output=True)
         r = subprocess.run(
@@ -387,6 +388,7 @@ def _extract_binary_from_image(image: str, dest: str) -> bool:
                     f"{r.stderr.strip()}{bcolors.END}"
                 )
                 return False
+        created = True
         for path in _IMAGE_BINARY_PATHS:
             cp = subprocess.run(
                 ["docker", "cp", f"{probe}:{path}", dest],
@@ -404,7 +406,8 @@ def _extract_binary_from_image(image: str, dest: str) -> bool:
         print(f"{bcolors.RED}docker not found{bcolors.END}")
         return False
     finally:
-        subprocess.run(["docker", "rm", "-f", probe], capture_output=True)
+        if created:
+            subprocess.run(["docker", "rm", "-f", probe], capture_output=True)
 
 
 _COPY_BINARY_RE = re.compile(r"COPY xrpld\.\S+ /opt/xrpld/bin/xrpld")
