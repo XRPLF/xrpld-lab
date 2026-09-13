@@ -60,7 +60,7 @@ jobs:
         run: poetry install
 
       - name: Run unit tests with coverage
-        run: poetry run pytest tests --cov=xrpld_lab --cov-report=term
+        run: poetry run pytest tests --cov=xrpld_lab --cov-report=term-missing --cov-fail-under=100
 
   cli-test:
     runs-on: ubuntu-latest
