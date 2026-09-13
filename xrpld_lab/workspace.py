@@ -16,15 +16,23 @@ class Workspace:
         """Directory containing static assets (deploykit, genesis files, etc.)."""
         return os.path.abspath(os.path.dirname(__file__))
 
+    def cluster_path(self, name: str) -> str:
+        """Path of a network cluster directory, without creating it."""
+        return os.path.join(self.base, f"{name}-cluster")
+
+    def standalone_path(self, protocol: str, name: str) -> str:
+        """Path of a standalone directory, without creating it."""
+        return os.path.join(self.base, f"{protocol}-{name}")
+
     def cluster_dir(self, name: str) -> str:
         """Create and return path for a network cluster."""
-        path = os.path.join(self.base, f"{name}-cluster")
+        path = self.cluster_path(name)
         os.makedirs(path, exist_ok=True)
         return path
 
     def standalone_dir(self, protocol: str, name: str) -> str:
         """Create and return path for a standalone instance."""
-        path = os.path.join(self.base, f"{protocol}-{name}")
+        path = self.standalone_path(protocol, name)
         os.makedirs(path, exist_ok=True)
         return path
 

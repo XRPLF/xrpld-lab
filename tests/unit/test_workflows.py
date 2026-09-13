@@ -5,6 +5,7 @@
 
 import json
 import os
+import pathlib
 from unittest.mock import MagicMock, patch, call
 
 import pytest
@@ -1202,3 +1203,46 @@ class TestNetworkBinaryStaging:
             assert host_vars["docker_image_name"] == "ubuntu:noble", ip
             assert host_vars["docker_build_tag"] == f"{node}:abc1234", ip
             assert host_vars["build_context"] == str(cluster / node)
+
+
+class TestGenesisResolution(_NetworkRunnerSetup):
+    """Unset --genesis follows the cluster's keystore; inputs resolve before the dir exists."""
+
+    ansible = False
+
+    def _cluster(self):
+        name = self.lab.build_source.cluster_name or self.lab.build_source.build_version
+        return self.workspace.cluster_path(name)
+
+    def test_fresh_workspace_means_genesis(self):
+        self.lab.genesis = None
+        LabRunner(self.lab, self.workspace).run()
+        self.mocks["update_genesis"].assert_called()
+
+    def test_existing_keystore_means_preserve(self):
+        self.lab.genesis = None
+        pathlib.Path(self._cluster(), "keystore").mkdir(parents=True)
+        LabRunner(self.lab, self.workspace).run()
+        self.mocks["update_genesis"].assert_not_called()
+
+    def test_explicit_true_wins_over_a_keystore(self):
+        self.lab.genesis = True
+        pathlib.Path(self._cluster(), "keystore").mkdir(parents=True)
+        LabRunner(self.lab, self.workspace).run()
+        self.mocks["update_genesis"].assert_called()
+
+    def test_failed_feature_resolution_leaves_no_directory(self):
+        self.lab.genesis = None
+        self.mocks["resolver"].return_value.resolve_features.side_effect = RuntimeError(
+            "boom"
+        )
+        with pytest.raises(RuntimeError, match="boom"):
+            LabRunner(self.lab, self.workspace).run()
+        assert not pathlib.Path(self._cluster()).exists()
+
+    def test_missing_binary_leaves_no_directory(self, tmp_path):
+        self.lab.genesis = None
+        self.lab.build_source.binary_path = str(tmp_path / "absent")
+        with pytest.raises(FileNotFoundError):
+            LabRunner(self.lab, self.workspace).run()
+        assert not pathlib.Path(self._cluster()).exists()

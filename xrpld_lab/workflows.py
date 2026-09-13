@@ -144,6 +144,12 @@ class LabRunner:
         """Render the node's xrpld.cfg with the lab's config overrides applied."""
         return apply_overrides(XrpldCfgBuilder(node).build(), self.lab.config_overrides)
 
+    def _resolve_genesis(self, cluster_path: str) -> bool:
+        """The lab's genesis flag, else fresh unless the cluster has a keystore."""
+        if self.lab.genesis is not None:
+            return self.lab.genesis
+        return not os.path.isdir(os.path.join(cluster_path, "keystore"))
+
     def _stage_binary(self, source, dest: str) -> None:
         """Copy the local binary, or download it from the build server in binary mode.
 
@@ -189,10 +195,10 @@ class LabRunner:
         # Determine build dir name
         name = source.build_version
         protocol_name = lab.protocol.value
-        base_dir = self.workspace.standalone_dir(protocol_name, name)
 
-        # 1. Resolve features
+        # 1. Resolve features before the directory exists
         feature_lines = self._resolve_feature_lines(source, spec)
+        base_dir = self.workspace.standalone_dir(protocol_name, name)
 
         # 2. Create node config
         node = NodeFactory.create_standalone(
@@ -290,10 +296,14 @@ class LabRunner:
 
         name = source.cluster_name or source.build_version
         protocol_name = lab.protocol.value
-        cluster_dir = self.workspace.cluster_dir(name)
+        cluster_path = self.workspace.cluster_path(name)
 
-        # 1. Resolve features
+        # 1. Resolve every input before the cluster directory exists
         feature_lines = self._resolve_feature_lines(source, spec)
+        if source.binary_path and not os.path.isfile(source.binary_path):
+            raise FileNotFoundError(f"binary not found: {source.binary_path}")
+        genesis = self._resolve_genesis(cluster_path)
+        cluster_dir = self.workspace.cluster_dir(name)
 
         # 1c. Binary: copy local or download from build server
         staged_binary = os.path.join(cluster_dir, f"xrpld.{name}")
@@ -309,7 +319,7 @@ class LabRunner:
             if not vl_keys:
                 # Fresh VL keys change the network identity — never mint them
                 # silently for a network being preserved.
-                if not lab.genesis:
+                if not genesis:
                     raise RuntimeError(
                         "non-genesis deploy but no VL publisher keys in this "
                         "workspace — run from the workspace that created the "
@@ -332,7 +342,7 @@ class LabRunner:
                 vc = ValidatorClient(node_name)
                 key_path = f"keystore/{node_name}/key.json"
                 if not os.path.exists(key_path):
-                    if not lab.genesis:
+                    if not genesis:
                         raise RuntimeError(
                             f"non-genesis deploy but {key_path} is missing — "
                             "a regenerated validator key would change the "
@@ -413,7 +423,7 @@ class LabRunner:
 
             # Amendments + genesis. A preserved network has no genesis to write: the
             # node boots from its existing db and takes amendments from the chain.
-            if lab.genesis:
+            if genesis:
                 features = parse_amendments(
                     feature_lines, include_unsupported=self.lab.all_amendments
                 )
@@ -433,9 +443,9 @@ class LabRunner:
                 version=name,
                 # Non-genesis: no genesis.json in the image and a plain entrypoint —
                 # the node boots from its preserved db and syncs with its peers.
-                include_genesis=lab.genesis or lab.db_seed,
+                include_genesis=genesis or lab.db_seed,
                 quorum=lab.effective_quorum,
-                standalone="--valid" if lab.genesis else None,
+                standalone="--valid" if genesis else None,
                 db_seed=lab.db_seed,
             )
             write_file(os.path.join(node_dir, "Dockerfile"), dockerfile)
@@ -494,7 +504,7 @@ class LabRunner:
             save_config(protocol_name, cfg_path, cfg_content, vl_content)
 
             # Amendments + genesis (peers always get all amendments)
-            if lab.genesis:
+            if genesis:
                 features = parse_amendments(
                     feature_lines, include_unsupported=self.lab.all_amendments
                 )
@@ -514,9 +524,9 @@ class LabRunner:
                 version=name,
                 # Non-genesis: no genesis.json in the image and a plain entrypoint —
                 # the node boots from its preserved db and syncs with its peers.
-                include_genesis=lab.genesis or lab.db_seed,
+                include_genesis=genesis or lab.db_seed,
                 quorum=lab.effective_quorum,
-                standalone="--valid" if lab.genesis else None,
+                standalone="--valid" if genesis else None,
                 db_seed=lab.db_seed,
             )
             write_file(os.path.join(node_dir, "Dockerfile"), dockerfile)
@@ -581,6 +591,7 @@ class LabRunner:
                 cluster_dir,
                 name,
                 ansible_image,
+                genesis,
                 build_tag=(
                     (source.commit_hash or source.build_version) if use_binary else ""
                 ),
@@ -596,6 +607,7 @@ class LabRunner:
         cluster_dir: str,
         name: str,
         image_name: str,
+        genesis: bool,
         build_tag: str = "",
     ):
         """Generate ansible deployment files for the cluster."""
@@ -603,7 +615,7 @@ class LabRunner:
             cluster_dir=cluster_dir,
             config=lab.ansible,
             image_name=image_name,
-            genesis=lab.genesis,
+            genesis=genesis,
             build_tag=build_tag,
         )
 
