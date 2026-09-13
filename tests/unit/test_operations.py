@@ -28,8 +28,12 @@ import requests
 
 from xrpld_lab.models import NodeRole, PortSet
 from xrpld_lab.operations import (
+    _IMAGE_BINARY_PATHS,
     _admin_rpc_port,
+    _docker_container_exists,
     _dockerfile_with_binary,
+    _download_binary,
+    _extract_binary_from_image,
     vote_amendment,
     node_stall,
     remove_network,
@@ -364,6 +368,17 @@ class TestLocalScripts:
     def test_stop_local_reports_failure(self, mock_cwd, mock_isfile, mock_run):
         assert stop_local() is False
 
+    @patch("xrpld_lab.operations.run_command")
+    def test_stop_local_without_stop_sh_runs_nothing(
+        self, mock_run, tmp_path, monkeypatch, capsys
+    ):
+        monkeypatch.chdir(tmp_path)
+
+        assert stop_local() is False
+
+        mock_run.assert_not_called()
+        assert f"stop.sh not found in {os.getcwd()}" in capsys.readouterr().out
+
 
 # -------------------------------------------------------------------------
 # update_node_binary
@@ -385,6 +400,203 @@ def _write_fetched(dest: str) -> bool:
     with open(dest, "wb") as f:
         f.write(b"\x7fELF")
     return True
+
+
+class TestDockerContainerExists:
+    """``docker ps -a`` filtered on the exact name decides whether a container exists."""
+
+    _ARGV = [
+        "docker",
+        "ps",
+        "-a",
+        "--filter",
+        "name=^vnode2$",
+        "--format",
+        "{{.Names}}",
+    ]
+
+    @patch("xrpld_lab.operations.subprocess.run")
+    def test_listed_name_means_the_container_exists(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0, stdout="vnode2\n")
+
+        assert _docker_container_exists("vnode2") is True
+
+        mock_run.assert_called_once_with(self._ARGV, capture_output=True, text=True)
+
+    @patch("xrpld_lab.operations.subprocess.run")
+    def test_empty_listing_means_no_container(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=0, stdout="")
+
+        assert _docker_container_exists("vnode2") is False
+
+    @patch("xrpld_lab.operations.subprocess.run", side_effect=FileNotFoundError)
+    def test_missing_docker_means_no_container(self, mock_run):
+        assert _docker_container_exists("vnode2") is False
+
+
+class _FakeDocker:
+    """subprocess.run stand-in answering docker rm/create/pull/cp the way the CLI does.
+
+    *create_codes* are the exit codes of successive ``docker create`` calls;
+    ``docker cp`` succeeds only for in-image paths listed in *present*.
+    """
+
+    def __init__(self, create_codes, pull_code=0, present=(), create_stderr=""):
+        self.create_codes = list(create_codes)
+        self.pull_code = pull_code
+        self.present = present
+        self.create_stderr = create_stderr
+        self.calls = []
+
+    def __call__(self, argv, **kwargs):
+        self.calls.append((argv, kwargs))
+        verb = argv[1]
+        if verb == "rm":
+            return MagicMock(returncode=0, stdout="", stderr="")
+        if verb == "create":
+            code = self.create_codes.pop(0)
+            return MagicMock(
+                returncode=code, stdout="", stderr=self.create_stderr if code else ""
+            )
+        if verb == "pull":
+            return MagicMock(returncode=self.pull_code)
+        if verb == "cp":
+            src, dest = argv[2], argv[3]
+            path = src.split(":", 1)[1]
+            if path in self.present:
+                _write_fetched(dest)
+                return MagicMock(returncode=0, stdout="", stderr="")
+            return MagicMock(
+                returncode=1,
+                stdout="",
+                stderr=f"Error response from daemon: Could not find the file {path}",
+            )
+        raise AssertionError(f"unexpected docker call: {argv}")
+
+    @property
+    def argvs(self):
+        return [argv for argv, _ in self.calls]
+
+
+class TestExtractBinaryFromImage:
+    """A probe container is created (pulling the image when absent), the binary is
+    copied out of the first known path that exists, and the probe is always removed."""
+
+    IMAGE = "europe-docker.pkg.dev/xrpl-perf/xrpld/xrpld:3.4.0-dg"
+
+    @staticmethod
+    def _probe() -> str:
+        return f"xrpld-extract-{os.getpid()}"
+
+    def _run(self, docker: _FakeDocker, tmp_path) -> tuple[bool, str]:
+        dest = str(tmp_path / "xrpld.3.4.0")
+        with patch("xrpld_lab.operations.subprocess.run", docker):
+            ok = _extract_binary_from_image(self.IMAGE, dest)
+        return ok, dest
+
+    def test_local_image_is_copied_from_the_first_known_path(self, tmp_path):
+        docker = _FakeDocker(create_codes=[0], present=("/opt/xrpld/bin/xrpld",))
+
+        ok, dest = self._run(docker, tmp_path)
+
+        assert ok is True
+        assert open(dest, "rb").read() == b"\x7fELF"
+        probe = self._probe()
+        assert docker.argvs == [
+            ["docker", "rm", "-f", probe],
+            ["docker", "create", "--name", probe, self.IMAGE],
+            ["docker", "cp", f"{probe}:/opt/xrpld/bin/xrpld", dest],
+            ["docker", "rm", "-f", probe],
+        ]
+        assert docker.calls[1][1] == {"capture_output": True, "text": True}
+        assert docker.calls[2][1] == {"capture_output": True, "text": True}
+        assert docker.calls[3][1] == {"capture_output": True}
+
+    def test_missing_image_is_pulled_then_created(self, tmp_path):
+        docker = _FakeDocker(create_codes=[1, 0], present=("/usr/bin/xrpld",))
+
+        ok, dest = self._run(docker, tmp_path)
+
+        assert ok is True
+        assert open(dest, "rb").read() == b"\x7fELF"
+        probe = self._probe()
+        assert docker.argvs == [
+            ["docker", "rm", "-f", probe],
+            ["docker", "create", "--name", probe, self.IMAGE],
+            ["docker", "pull", self.IMAGE],
+            ["docker", "create", "--name", probe, self.IMAGE],
+            ["docker", "cp", f"{probe}:/opt/xrpld/bin/xrpld", dest],
+            ["docker", "cp", f"{probe}:/usr/bin/xrpld", dest],
+            ["docker", "rm", "-f", probe],
+        ]
+        # The pull streams its progress to the terminal: nothing captured.
+        assert docker.calls[2][1] == {}
+
+    def test_failed_pull_is_reported(self, tmp_path, capsys):
+        docker = _FakeDocker(create_codes=[1], pull_code=1)
+
+        ok, dest = self._run(docker, tmp_path)
+
+        assert ok is False
+        assert f"Cannot pull image {self.IMAGE}" in capsys.readouterr().out
+        assert not os.path.exists(dest)
+        assert [a[1] for a in docker.argvs] == ["rm", "create", "pull", "rm"]
+
+    def test_failed_create_after_pull_is_reported(self, tmp_path, capsys):
+        stderr = (
+            f"Unable to find image '{self.IMAGE}' locally\n"
+            "docker: Error response from daemon: manifest unknown\n"
+        )
+        docker = _FakeDocker(create_codes=[1, 1], create_stderr=stderr)
+
+        ok, dest = self._run(docker, tmp_path)
+
+        assert ok is False
+        assert (
+            "docker create failed: Unable to find image "
+            f"'{self.IMAGE}' locally\ndocker: Error response from daemon: "
+            "manifest unknown"
+        ) in capsys.readouterr().out
+        assert not os.path.exists(dest)
+        assert [a[1] for a in docker.argvs] == ["rm", "create", "pull", "create", "rm"]
+
+    def test_no_binary_at_any_known_path_is_reported(self, tmp_path, capsys):
+        docker = _FakeDocker(create_codes=[0], present=())
+
+        ok, dest = self._run(docker, tmp_path)
+
+        assert ok is False
+        assert (
+            f"No xrpld/rippled binary found in {self.IMAGE} "
+            f"(tried {', '.join(_IMAGE_BINARY_PATHS)})"
+        ) in capsys.readouterr().out
+        assert not os.path.exists(dest)
+        probe = self._probe()
+        assert [a for a in docker.argvs if a[1] == "cp"] == [
+            ["docker", "cp", f"{probe}:{path}", dest] for path in _IMAGE_BINARY_PATHS
+        ]
+        assert docker.argvs[-1] == ["docker", "rm", "-f", probe]
+
+    @patch("xrpld_lab.operations.subprocess.run", side_effect=FileNotFoundError)
+    def test_missing_docker_is_reported_then_cleanup_raises(
+        self, mock_run, tmp_path, capsys
+    ):
+        with pytest.raises(FileNotFoundError):
+            _extract_binary_from_image(self.IMAGE, str(tmp_path / "xrpld.3.4.0"))
+
+        assert "docker not found" in capsys.readouterr().out
+        assert mock_run.call_args.args[0] == ["docker", "rm", "-f", self._probe()]
+
+
+class TestDownloadBinary:
+    @patch("xrpld_lab.operations.subprocess.run", side_effect=FileNotFoundError)
+    def test_missing_curl_is_reported(self, mock_run, tmp_path, capsys):
+        dest = str(tmp_path / "xrpld.3.4.0")
+
+        assert _download_binary("https://b/3.4.0", dest) is False
+
+        assert "curl not found" in capsys.readouterr().out
+        assert not os.path.exists(dest)
 
 
 class TestDockerfileWithBinary:
@@ -595,6 +807,29 @@ class TestUpdateNodeBinary:
         )
 
         assert ok is False
+        mock_run.assert_called_once_with(
+            str(tmp_path / "my-net"), "docker compose stop vnode2"
+        )
+
+    @patch("xrpld_lab.operations.remove_directory", return_value=False)
+    @patch("xrpld_lab.operations.run_command", return_value=0)
+    @patch(
+        "xrpld_lab.operations._download_binary",
+        side_effect=lambda u, d: _write_fetched(d),
+    )
+    def test_failed_lib_removal_skips_the_rebuild(
+        self, mock_dl, mock_run, mock_rm, tmp_path
+    ):
+        node_dir = self._cluster(tmp_path, "vnode2", _network_dockerfile(binary=False))
+        lib_dir = os.path.join(node_dir, "lib")
+        os.makedirs(lib_dir)
+
+        ok = update_node_binary(
+            str(tmp_path / "my-net"), 2, "validator", "https://b", "3.4.0"
+        )
+
+        assert ok is False
+        mock_rm.assert_called_once_with(lib_dir)
         mock_run.assert_called_once_with(
             str(tmp_path / "my-net"), "docker compose stop vnode2"
         )
@@ -960,6 +1195,18 @@ class TestNodeStall:
             capsys.readouterr().out
         )
 
+    @patch("xrpld_lab.operations.requests.post")
+    def test_non_json_reply_is_a_failure(self, mock_post, tmp_path, capsys):
+        resp = _rpc_response()
+        resp.json.side_effect = ValueError("Expecting value: line 1 column 1")
+        mock_post.return_value = resp
+
+        assert node_stall(_cluster(tmp_path, "vnode1"), 1, "validator") is False
+
+        out = capsys.readouterr().out
+        assert "RPC response is not JSON" in out
+        assert "node_stall RPC sent" not in out
+
     @patch(
         "xrpld_lab.operations.requests.post",
         side_effect=requests.ConnectionError("refused"),
@@ -1006,3 +1253,24 @@ class TestLogs:
         call_args = mock_run.call_args[0][0]
         assert "docker" in call_args
         assert "xrpl" in call_args
+
+    @patch("xrpld_lab.operations.subprocess.run", side_effect=KeyboardInterrupt)
+    def test_view_local_logs_returns_on_ctrl_c(self, mock_run, tmp_path, capsys):
+        log_dir = tmp_path / "vnode1" / "log"
+        log_dir.mkdir(parents=True)
+        log_file = str(log_dir / "debug.log")
+        open(log_file, "w").close()
+
+        assert view_local_logs(str(tmp_path), "vnode1") is None
+
+        mock_run.assert_called_once_with(["tail", "-f", log_file], check=False)
+        assert f"Tailing {log_file} (Ctrl+C to stop)..." in capsys.readouterr().out
+
+    @patch("xrpld_lab.operations.subprocess.run", side_effect=KeyboardInterrupt)
+    def test_view_standalone_logs_returns_on_ctrl_c(self, mock_run, capsys):
+        assert view_standalone_logs("xrpl") is None
+
+        mock_run.assert_called_once_with(["docker", "logs", "-f", "xrpl"], check=False)
+        assert "Tailing Docker logs for 'xrpl' (Ctrl+C to stop)..." in (
+            capsys.readouterr().out
+        )
