@@ -621,11 +621,15 @@ class AnsibleBuilder:
         )
 
     def _write_vl(self, host_dir: str, host: ServicesHost) -> None:
+        if not host.nginx:
+            raise ValueError(
+                f"services host {host.name}: vl requires nginx on the same host "
+                "(the vl vhost is served by that nginx and named vl.<nginx domain>)"
+            )
         svc_dir = os.path.join(host_dir, "vl")
         os.makedirs(svc_dir, exist_ok=True)
         cfg = host.vl
-        domain = host.nginx.domain if host.nginx else ""
-        cn = _nginx_tls_cn("vl", domain)
+        cn = _nginx_tls_cn("vl", host.nginx.domain)
 
         # The signed list is produced in the cluster dir; stage a copy beside
         # the playbook
@@ -643,7 +647,7 @@ class AnsibleBuilder:
                 "writing its VL vhost"
             )
 
-        le = list(host.nginx.letsencrypt_services or []) if host.nginx else []
+        le = list(host.nginx.letsencrypt_services or [])
         vars_data = {
             "VL_SSL_CN": cn,
             "VL_ROOT": cfg.root_dir,
@@ -669,7 +673,9 @@ class AnsibleBuilder:
                 "docker_network_name": cfg.network_name,
                 "docker_image_name": cfg.image,
                 "docker_container_name": cfg.container_name,
-                "docker_container_ports": ["6379:6379"],
+                # Loopback only: the host's status sampler checks it; the debug
+                # container reaches redis by name over docker_network_name.
+                "docker_container_ports": ["127.0.0.1:6379:6379"],
             },
         )
         self._file_write(
@@ -722,8 +728,10 @@ class AnsibleBuilder:
         cfg = host.debug
         endpoint = cfg.endpoint
         if not endpoint:
+            # host.docker.internal maps to host-gateway in the container, the
+            # default-bridge address websocketd binds.
             stream_port = host.stream.port if host.stream else 1400
-            endpoint = f"ws://{host.ip}:{stream_port}/"
+            endpoint = f"ws://host.docker.internal:{stream_port}/"
         self._write_vars(
             os.path.join(svc_dir, "vars.yml"),
             {
@@ -834,7 +842,8 @@ _DEPS_YML = """---
   - name: Add ubuntu user to the docker group
     user:
       name: ubuntu
-      group: docker
+      groups: docker
+      append: yes
 """
 
 _MAIN_HEADER = """- hosts: nodes
@@ -1219,6 +1228,7 @@ _NGINX_MAIN_TPL = """- hosts: {group}
               ssl_certificate "{{{{ SSL_CERT }}}}";
               ssl_certificate_key "{{{{ SSL_KEY }}}}";
               include /etc/nginx/snippets/ssl-params.conf;
+              add_header 'Access-Control-Allow-Origin' '*' always;
               access_log /var/log/nginx/access.log;
               location / {{
                   proxy_hide_header X-Powered-By;
@@ -1235,7 +1245,6 @@ _NGINX_MAIN_TPL = """- hosts: {group}
                   proxy_redirect off;
                   proxy_pass http://{{{{ IP }}}}:{{{{ PORT }}}};
                   proxy_cache_bypass $http_upgrade;
-                  add_header 'Access-Control-Allow-Origin' '*' always;
               }}
 {status_locations}          }}
   - name: Link WSS proxy
@@ -1268,6 +1277,7 @@ _NGINX_MAIN_TPL = """- hosts: {group}
               ssl_certificate "{{{{ RPC_SSL_CERT }}}}";
               ssl_certificate_key "{{{{ RPC_SSL_KEY }}}}";
               include /etc/nginx/snippets/ssl-params.conf;
+              add_header 'Access-Control-Allow-Origin' '*' always;
               access_log /var/log/nginx/access.log;
               location / {{
                   proxy_hide_header X-Powered-By;
@@ -1284,7 +1294,6 @@ _NGINX_MAIN_TPL = """- hosts: {group}
                   proxy_redirect off;
                   proxy_pass http://{{{{ RPC_IP }}}}:{{{{ RPC_PORT }}}};
                   proxy_cache_bypass $http_upgrade;
-                  add_header 'Access-Control-Allow-Origin' '*' always;
               }}
           }}
   - name: Link RPC proxy
@@ -1560,6 +1569,7 @@ _REDIS_MAIN_TPL = """- hosts: {group}
     docker_container:
       name: "{{{{ docker_container_name }}}}"
       image: "{{{{ docker_image_name }}}}"
+      ports: "{{{{ docker_container_ports }}}}"
       networks:
         - name: "{{{{ docker_network_name }}}}"
       state: started
@@ -1605,6 +1615,8 @@ _WEBSOCKETD_URL = (
     "websocketd-0.4.1-linux_amd64.zip"
 )
 
+# websocketd binds the default docker bridge address (docker0): the debugstream
+# container reaches it as host.docker.internal, off-host clients cannot route to it.
 _STREAM_MAIN_TPL = """---
 - hosts: {group}
   become: true
@@ -1649,7 +1661,9 @@ _STREAM_MAIN_TPL = """---
 
         [Service]
         Type=simple
-        ExecStart=/usr/local/bin/websocketd --port={{{{ websocketd_port }}}} \\
+        ExecStart=/usr/local/bin/websocketd \\
+          --address={{{{ ansible_facts['docker0']['ipv4']['address'] }}}} \\
+          --port={{{{ websocketd_port }}}} \\
           /usr/local/bin/node-logviewer.sh
         Restart=always
         RestartSec=10
@@ -1694,6 +1708,8 @@ _DEBUG_MAIN_TPL = """- hosts: {group}
       image: "{{{{ docker_image_name }}}}"
       ports: "{{{{ docker_container_ports }}}}"
       env: "{{{{ docker_env_variables }}}}"
+      etc_hosts:
+        host.docker.internal: host-gateway
       networks:
         - name: "{{{{ docker_network_name }}}}"
       state: started

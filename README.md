@@ -136,7 +136,7 @@ vips:
 pips:
   - 10.0.0.4
 services:
-  - ip: 10.0.0.5
+  - ip: 10.0.0.4
     name: infra
     nginx:
       domain: example.com
@@ -154,7 +154,16 @@ services:
 playbooks (`deps.yml`, `main.yml`, `clean.yml`, `alloy.yml`, `status.yml`) target; each
 services host is its own group, targeted only by its service playbooks. A services host
 whose IP is not in `vips` or `pips` is therefore never touched by a node playbook; one that
-is also a node sits in both groups.
+is also a node sits in both groups (the example host `10.0.0.4` is the peer, which
+`status:` and `stream:` require). `vl:` requires `nginx:` on the same host: its vhost is
+`vl.<domain>` served by that nginx, and the builder raises `ValueError` otherwise.
+
+Services bind only where their clients are: redis is published on `127.0.0.1:6379` (the
+host's status sampler checks it; the debugstream container reaches it by container name
+over the docker network), and the websocketd log stream binds the default docker bridge
+address (`docker0`), which the debugstream container reaches as `host.docker.internal`
+and which is not routable from off-host. The `debug.<domain>` nginx vhost is the public
+way in.
 
 **Status service** (`status:` on the services host, which must be one of the nodes). Every
 node gets `node_metrics.py` as the `xrpld-status` systemd unit: it samples `/proc`, the
