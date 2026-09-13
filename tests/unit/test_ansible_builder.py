@@ -122,6 +122,14 @@ class TestCoreFiles:
         builder.write()
         assert os.path.exists(os.path.join(builder.ansible_dir, "deps.yml"))
 
+    def test_deps_appends_docker_to_ubuntu_groups(self, tmp_path):
+        """`group:` would replace ubuntu's primary group; docker is supplementary."""
+        builder = _build_basic(tmp_path)
+        builder.write()
+        plays = yaml.safe_load(open(os.path.join(builder.ansible_dir, "deps.yml")))
+        task = next(t for t in plays[0]["tasks"] if "user" in t)
+        assert task["user"] == {"name": "ubuntu", "groups": "docker", "append": True}
+
     def test_write_creates_main_yml(self, tmp_path):
         builder = _build_basic(tmp_path)
         builder.write()
@@ -646,6 +654,47 @@ class TestNginx:
         assert data["RPC_SSL_CN"] == "rpc.test.example.com"
         assert data["FAUCET_SSL_CN"] == "faucet.test.example.com"
 
+    @staticmethod
+    def _vhost_blocks(builder) -> dict:
+        """Rendered nginx config per vhost task name, from the blockinfile tasks."""
+        plays = yaml.safe_load(
+            open(
+                os.path.join(
+                    builder.ansible_dir, "services", "proxy", "nginx", "main.yml"
+                )
+            )
+        )
+        return {
+            t["name"]: t["blockinfile"]["block"]
+            for t in plays[0]["tasks"]
+            if "blockinfile" in t
+        }
+
+    @pytest.mark.parametrize(
+        "task", ["Write WSS proxy config", "Write RPC proxy config"]
+    )
+    def test_cors_header_is_set_at_server_level(self, tmp_path, task):
+        """An add_header inside location / would drop the ssl-params.conf headers
+        (HSTS, X-Frame-Options, ...) for that location: nginx inherits add_header
+        only into levels that set none of their own."""
+        builder = self._builder_with_nginx(tmp_path)
+        builder.write()
+        block = self._vhost_blocks(builder)[task]
+        cors = "add_header 'Access-Control-Allow-Origin' '*' always;"
+        server_level, location = block.split("location / {", 1)
+        assert cors in server_level
+        assert "include /etc/nginx/snippets/ssl-params.conf;" in server_level
+        assert cors not in location
+
+    def test_cors_header_only_on_wss_and_rpc(self, tmp_path):
+        builder = self._builder_with_nginx(tmp_path)
+        builder.write()
+        blocks = self._vhost_blocks(builder)
+        with_cors = {
+            name for name, block in blocks.items() if "Access-Control" in block
+        }
+        assert with_cors == {"Write WSS proxy config", "Write RPC proxy config"}
+
     def test_run_sh_includes_nginx(self, tmp_path):
         builder = self._builder_with_nginx(tmp_path)
         builder.write()
@@ -855,6 +904,32 @@ class TestRedis:
         assert data["docker_image_name"] == "redis"
         assert data["docker_container_name"] == "alpha-redis-main"
 
+    def test_redis_is_published_on_loopback(self, tmp_path):
+        """The host's status sampler checks 127.0.0.1:6379; nothing off-host
+        needs redis, and an unpublished port is reported down."""
+        cluster_dir = str(tmp_path / "test-cluster")
+        os.makedirs(cluster_dir, exist_ok=True)
+        config = AnsibleConfig(
+            vips=["10.0.0.1"],
+            pips=["10.0.0.10"],
+            services=[ServicesHost(name="infra", ip="10.0.0.10", redis=RedisConfig())],
+        )
+        builder = AnsibleBuilder(cluster_dir, config, "transia/cluster:abc")
+        builder.add_node(
+            "pnode1",
+            "10.0.0.10",
+            _peer_ports(1),
+            f"{cluster_dir}/pnode1/config/",
+            "peer",
+        )
+        builder.write()
+        svc_dir = os.path.join(builder.ansible_dir, "services", "infra", "redis")
+        data = yaml.safe_load(open(os.path.join(svc_dir, "vars.yml")))
+        assert data["docker_container_ports"] == ["127.0.0.1:6379:6379"]
+        plays = yaml.safe_load(open(os.path.join(svc_dir, "main.yml")))
+        deploy = next(t for t in plays[0]["tasks"] if "docker_container" in t)
+        assert deploy["docker_container"]["ports"] == "{{ docker_container_ports }}"
+
     def test_redis_playbook_targets_host_group(self, tmp_path):
         cluster_dir = str(tmp_path / "test-cluster")
         os.makedirs(cluster_dir, exist_ok=True)
@@ -986,6 +1061,46 @@ class TestStream:
         assert data["websocketd_port"] == 1400
         assert data["docker_container_name"] == "pnode1"
 
+    def test_websocketd_binds_the_docker_bridge_address(self, tmp_path):
+        """debug.log streams unauthenticated: only in-host clients (the debugstream
+        container, over the bridge) may reach port 1400, never every interface."""
+        cluster_dir = str(tmp_path / "test-cluster")
+        os.makedirs(cluster_dir, exist_ok=True)
+        config = AnsibleConfig(
+            vips=["10.0.0.1"],
+            pips=["10.0.0.10"],
+            services=[
+                ServicesHost(name="proxy", ip="10.0.0.10", stream=StreamConfig())
+            ],
+        )
+        builder = AnsibleBuilder(cluster_dir, config, "transia/cluster:abc")
+        builder.add_node(
+            "pnode1",
+            "10.0.0.10",
+            _peer_ports(1),
+            f"{cluster_dir}/pnode1/config/",
+            "peer",
+        )
+        builder.write()
+        plays = yaml.safe_load(
+            open(
+                os.path.join(
+                    builder.ansible_dir, "services", "proxy", "stream", "main.yml"
+                )
+            )
+        )
+        unit = next(
+            t["copy"]["content"]
+            for t in plays[0]["tasks"]
+            if t.get("copy", {}).get("dest")
+            == "/etc/systemd/system/websocketd-node-logs.service"
+        )
+        exec_start = unit.split("ExecStart=", 1)[1].split("Restart=", 1)[0]
+        assert (
+            "--address={{ ansible_facts['docker0']['ipv4']['address'] }}" in exec_start
+        )
+        assert "--port={{ websocketd_port }}" in exec_start
+
 
 # ===========================================================================
 # Optional: Debug
@@ -1034,6 +1149,44 @@ class TestDebug:
             data = yaml.safe_load(f)
         assert data["docker_image_name"] == "transia/debugstream"
         assert data["docker_env_variables"]["ENDPOINT"] == "ws://10.0.0.10:1400/"
+
+    def test_default_endpoint_reaches_websocketd_through_host_gateway(self, tmp_path):
+        """websocketd binds the default bridge address; host.docker.internal maps to
+        host-gateway, the same address, inside the container."""
+        cluster_dir = str(tmp_path / "test-cluster")
+        os.makedirs(cluster_dir, exist_ok=True)
+        config = AnsibleConfig(
+            vips=["10.0.0.1"],
+            pips=["10.0.0.10"],
+            services=[
+                ServicesHost(
+                    name="proxy",
+                    ip="10.0.0.10",
+                    stream=StreamConfig(port=1401),
+                    debug=DebugConfig(),
+                ),
+            ],
+        )
+        builder = AnsibleBuilder(cluster_dir, config, "transia/cluster:abc")
+        builder.add_node(
+            "pnode1",
+            "10.0.0.10",
+            _peer_ports(1),
+            f"{cluster_dir}/pnode1/config/",
+            "peer",
+        )
+        builder.write()
+        svc_dir = os.path.join(builder.ansible_dir, "services", "proxy", "debug")
+        data = yaml.safe_load(open(os.path.join(svc_dir, "vars.yml")))
+        assert (
+            data["docker_env_variables"]["ENDPOINT"]
+            == "ws://host.docker.internal:1401/"
+        )
+        plays = yaml.safe_load(open(os.path.join(svc_dir, "main.yml")))
+        deploy = next(t for t in plays[0]["tasks"] if "docker_container" in t)
+        assert deploy["docker_container"]["etc_hosts"] == {
+            "host.docker.internal": "host-gateway"
+        }
 
 
 # ===========================================================================
@@ -1606,6 +1759,30 @@ class TestVlVhost:
         )
         with pytest.raises(FileNotFoundError):
             builder.write()
+
+    def test_vl_without_nginx_is_rejected(self, tmp_path):
+        """Without nginx the vhost would be named `vl.` and the play would assume
+        an nginx that was never installed."""
+        cluster_dir = str(tmp_path / "vl-cluster")
+        os.makedirs(cluster_dir, exist_ok=True)
+        config = AnsibleConfig(
+            vips=["10.0.0.1"],
+            pips=["10.0.0.10"],
+            services=[ServicesHost(name="peer", ip="10.0.0.10", vl=VlConfig())],
+        )
+        builder = AnsibleBuilder(cluster_dir, config, "transia/cluster:abc")
+        builder.add_node(
+            "pnode1",
+            "10.0.0.10",
+            _peer_ports(1),
+            f"{cluster_dir}/pnode1/config/",
+            "peer",
+        )
+        with pytest.raises(
+            ValueError, match=r"services host peer: vl requires nginx on the same host"
+        ):
+            builder.write()
+        assert not os.path.isdir(self._dir(builder))
 
     def test_hostname_is_vl_subdomain(self, tmp_path):
         builder = self._builder(tmp_path, VlConfig())
