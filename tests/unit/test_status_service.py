@@ -2,14 +2,17 @@
 # coding: utf-8
 
 import json
+import os
 import socket
+import sqlite3
 import struct
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
 import urllib.error
 import urllib.request
-from http.server import ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
@@ -40,13 +43,143 @@ def _fake_fetch(table):
     return fetch
 
 
+def _url(srv, path=""):
+    return f"http://127.0.0.1:{srv.server_address[1]}{path}"
+
+
 def _get(srv, path):
-    url = f"http://127.0.0.1:{srv.server_address[1]}{path}"
     try:
-        with urllib.request.urlopen(url, timeout=5) as resp:
+        with urllib.request.urlopen(_url(srv, path), timeout=5) as resp:
             return resp.status, json.loads(resp.read())
     except urllib.error.HTTPError as exc:
         return exc.code, json.loads(exc.read())
+
+
+def _get_raw(srv, path):
+    with urllib.request.urlopen(_url(srv, path), timeout=5) as resp:
+        return resp.status, resp.headers["Content-Type"], resp.read()
+
+
+def _serve(handler):
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
+def _closed_port():
+    """A loopback port nothing listens on: bound once, then released."""
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+@pytest.fixture
+def rpc():
+    """Loopback stand-in for xrpld's admin RPC and the debug stream's /health.
+
+    POST bodies are decoded into `calls`; `result` is the "result" of every
+    answer unless `body` sets the raw bytes to send instead.
+    """
+    state = SimpleNamespace(result=None, body=None, calls=[])
+
+    class RpcHandler(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args):
+            pass
+
+        def _reply(self, code, payload, content_type):
+            self.send_response(code)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def do_GET(self):
+            self._reply(200 if self.path == "/health" else 503, b"ok", "text/plain")
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", 0))
+            state.calls.append(
+                (self.headers["Content-Type"], json.loads(self.rfile.read(length)))
+            )
+            payload = state.body
+            if payload is None:
+                payload = json.dumps({"result": state.result}).encode()
+            self._reply(200, payload, "application/json")
+
+    srv = _serve(RpcHandler)
+    state.port = srv.server_address[1]
+    state.url = _url(srv, "/")
+    yield state
+    srv.shutdown()
+
+
+def _write_proc(
+    root,
+    cpu=(1000, 50, 300, 8000, 200, 10, 20, 0, 0, 0),
+    sda=(20000, 8000),
+    eth0=(100000, 40000),
+    procs=(),
+):
+    """A procfs tree of captured files under `root`.
+
+    `cpu` is the aggregate jiffy row of /proc/stat, `sda` and `eth0` the sector
+    and byte counters of the one whole disk and the one non-loopback interface,
+    `procs` a list of (pid, cmdline bytes or None, comm or None, VmRSS kB or None).
+    """
+    root = Path(root)
+    (root / "net").mkdir(parents=True, exist_ok=True)
+    (root / "self").mkdir(exist_ok=True)
+    (root / "stat").write_text(
+        "cpu  " + " ".join(str(v) for v in cpu) + "\n"
+        "cpu0 500 25 150 4000 100 5 10 0 0 0\n"
+        "intr 12345 0 0\n"
+        "ctxt 67890\n"
+    )
+    (root / "meminfo").write_text(
+        "MemTotal:       16384000 kB\n"
+        "MemFree:         1024000 kB\n"
+        "MemAvailable:    8192000 kB\n"
+        "Buffers:          256000 kB\n"
+        "SwapTotal:       2097152 kB\n"
+        "SwapFree:        1048576 kB\n"
+    )
+    (root / "diskstats").write_text(
+        "   7       0 loop0 10 0 80 5 0 0 0 0 0 0 0\n"
+        "   1       0 ram0 0 0 0 0 0 0 0 0 0 0 0\n"
+        " 253       0 dm-0 500 0 4000 100 300 0 2400 50 0 0 0\n"
+        f"   8       0 sda 1000 20 {sda[0]} 400 500 10 {sda[1]} 300 0 500 700\n"
+        "   8       1 sda1 900 20 18000 350 450 10 7000 250 0 400 600\n"
+    )
+    (root / "net" / "dev").write_text(
+        "Inter-|   Receive                                                "
+        "|  Transmit\n"
+        " face |bytes    packets errs drop fifo frame compressed multicast"
+        "|bytes    packets errs drop fifo colls carrier compressed\n"
+        "    lo: 5000 50 0 0 0 0 0 0 5000 50 0 0 0 0 0 0\n"
+        f"  eth0: {eth0[0]} 800 0 0 0 0 0 0 {eth0[1]} 300 0 0 0 0 0 0\n"
+        "  eth1: 20000 100 0 0 0 0 0 0 10000 60 0 0 0 0 0 0\n"
+    )
+    (root / "loadavg").write_text("0.52 0.48 0.40 1/512 12345\n")
+    for pid, cmdline, comm, rss_kb in procs:
+        entry = root / str(pid)
+        entry.mkdir(exist_ok=True)
+        if cmdline is not None:
+            (entry / "cmdline").write_bytes(cmdline)
+        if comm is not None:
+            (entry / "comm").write_text(comm + "\n")
+        if rss_kb is not None:
+            (entry / "status").write_text(
+                f"Name:\txrpld\nVmPeak:\t{rss_kb + 4096} kB\nVmRSS:\t{rss_kb} kB\n"
+            )
+    return str(root)
+
+
+XRPLD_PROC = (
+    4242,
+    b"/opt/xrpld/xrpld\x00--conf\x00/etc/xrpld.cfg\x00",
+    "xrpld-main",
+    2048000,
+)
 
 
 _XDGM_BYTES_FIELDS = ("ledger_hash", "node_public_key", "padding2", "version_string")
@@ -373,17 +506,17 @@ class TestDecodeXdgm:
         assert rec["version_string"] == "v" * 32
 
 
-def _server_info(state, build="3.1.0"):
-    return {
-        "info": {
-            "server_state": state,
-            "build_version": build,
-            "complete_ledgers": "1-100",
-            "peers": 4,
-            "uptime": 60,
-            "validated_ledger": {"seq": 100},
-        }
+def _server_info(state, build="3.1.0", **info):
+    info = {
+        "server_state": state,
+        "build_version": build,
+        "complete_ledgers": "1-100",
+        "peers": 4,
+        "uptime": 60,
+        "validated_ledger": {"seq": 100},
+        **info,
     }
+    return {"info": info}
 
 
 def _packet_full():
@@ -404,7 +537,10 @@ class _Stop(BaseException):
 
 
 class _ScriptedSampler(nm.Sampler):
-    """Builds the xrpld part of each row from a script of (rpc_result, packet)."""
+    """Builds the xrpld part of each row from a script of (rpc_result, packet).
+
+    A tick that is an exception is raised instead of producing a row.
+    """
 
     def __init__(self, cfg, ticks=()):
         super().__init__(cfg)
@@ -416,15 +552,52 @@ class _ScriptedSampler(nm.Sampler):
     def sample(self):
         if not self.ticks:
             raise _Stop
-        self.rpc, packet = self.ticks.pop(0)
+        tick = self.ticks.pop(0)
+        self.tick += 1
+        if isinstance(tick, BaseException):
+            raise tick
+        self.rpc, packet = tick
         self.xdgm = packet
         self.xdgm_ts = time.time() if packet else 0.0
-        self.tick += 1
         row = {"ts": self.base_ts + self.tick * 10, "xrpld_ok": 1}
         row.update(self.server_info())
         row.update(self.from_xdgm(row))
         self.latest = row
         return row
+
+
+def _run_loop(tmp_path, monkeypatch, ticks, cls=_ScriptedSampler):
+    """Drive sampler_loop through `ticks`; (sample rows, events, sampler)."""
+    db = str(tmp_path / "metrics.db")
+    cfg = SimpleNamespace(
+        db=db,
+        interval=0,
+        admin_rpc="http://127.0.0.1:5007/",
+        retain_raw_hours=48,
+        retain_5m_days=30,
+        retain_1h_days=365,
+    )
+    sampler = _sampler(monkeypatch, cfg, cls)
+    sampler.ticks = list(ticks)
+    monkeypatch.setattr(nm, "admin_rpc", lambda url, command: sampler.rpc)
+    with pytest.raises(_Stop):
+        nm.sampler_loop(cfg, sampler)
+    conn = nm.connect(db)
+    rows = [
+        dict(r)
+        for r in conn.execute(
+            "SELECT server_state, build_version, proposers, xdgm_ok, initial_sync_s "
+            "FROM samples ORDER BY ts"
+        )
+    ]
+    events = []
+    if conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'events'").fetchone():
+        events = [
+            (r["kind"], r["detail"])
+            for r in conn.execute("SELECT kind, detail FROM events ORDER BY ts")
+        ]
+    conn.close()
+    return rows, events, sampler
 
 
 class TestXdgmFallback:
@@ -463,34 +636,7 @@ class TestXdgmFallback:
         assert row["peers"] == 4
 
     def _run(self, tmp_path, monkeypatch, ticks):
-        db = str(tmp_path / "metrics.db")
-        cfg = SimpleNamespace(
-            db=db,
-            interval=0,
-            admin_rpc="http://127.0.0.1:5007/",
-            retain_raw_hours=48,
-            retain_5m_days=30,
-            retain_1h_days=365,
-        )
-        sampler = _sampler(monkeypatch, cfg, _ScriptedSampler)
-        sampler.ticks = list(ticks)
-        monkeypatch.setattr(nm, "admin_rpc", lambda url, command: sampler.rpc)
-        with pytest.raises(_Stop):
-            nm.sampler_loop(cfg, sampler)
-        conn = nm.connect(db)
-        rows = [
-            dict(r)
-            for r in conn.execute(
-                "SELECT server_state, build_version, proposers, xdgm_ok "
-                "FROM samples ORDER BY ts"
-            )
-        ]
-        events = [
-            (r["kind"], r["detail"])
-            for r in conn.execute("SELECT kind, detail FROM events ORDER BY ts")
-        ]
-        conn.close()
-        return rows, events
+        return _run_loop(tmp_path, monkeypatch, ticks)[:2]
 
     def test_no_state_change_event_when_only_the_rpc_drops(self, tmp_path, monkeypatch):
         rows, events = self._run(
@@ -682,3 +828,441 @@ class TestNodeRoutes:
         code, body = _get(server, "/")
         assert code == 404
         assert body["error"] == "dashboard not installed"
+
+    def test_dashboard_is_served_as_html(self, server, tmp_path):
+        page = b"<!doctype html><title>node</title><p>${name}</p>"
+        (tmp_path / "dashboard.html").write_bytes(page)
+        nm.Handler.cfg.dashboard = str(tmp_path / "dashboard.html")
+        for route in ("/", "/index.html"):
+            code, content_type, body = _get_raw(server, route)
+            assert code == 200
+            assert content_type == "text/html; charset=utf-8"
+            assert body == page
+
+    def test_series_window_past_the_raw_retention_reads_the_5m_rollup(self, server):
+        code, body = _get(server, "/api/series?window=176400")
+        assert code == 200
+        assert body["window"] == 176400
+        assert body["table"] == "rollup_5m"
+        assert body["points"] == []
+
+    def test_fetch_latest_reads_a_node_over_http(self, server):
+        assert nm.fetch_latest(_url(server)) == nm.Handler.sampler.latest
+        with pytest.raises(urllib.error.URLError):
+            nm.fetch_latest(f"http://127.0.0.1:{_closed_port()}", timeout=1)
+
+
+class TestProcReaders:
+    @pytest.fixture
+    def proc(self, tmp_path, monkeypatch):
+        root = tmp_path / "proc"
+        monkeypatch.setattr(nm, "PROC", str(root))
+        return root
+
+    def test_proc_stat_totals_the_aggregate_cpu_row(self, proc):
+        _write_proc(proc)
+        assert nm.read_proc_stat() == (9580, 8200, 200)
+
+    def test_meminfo_is_bytes_per_key(self, proc):
+        _write_proc(proc)
+        mem = nm.read_meminfo()
+        assert mem["MemTotal"] == 16384000 * 1024
+        assert mem["MemAvailable"] == 8192000 * 1024
+        assert mem["SwapTotal"] == 2097152 * 1024
+        assert mem["SwapFree"] == 1048576 * 1024
+        assert mem["Buffers"] == 256000 * 1024
+
+    def test_diskstats_counts_whole_disks_only(self, proc):
+        _write_proc(proc, sda=(20000, 8000))
+        assert nm.read_diskstats() == (20000 * 512, 8000 * 512)
+
+    def test_netdev_sums_every_interface_but_loopback(self, proc):
+        _write_proc(proc, eth0=(100000, 40000))
+        assert nm.read_netdev() == (100000 + 20000, 40000 + 10000)
+
+    def test_find_pid_matches_argv0(self, proc):
+        _write_proc(
+            proc,
+            procs=[
+                (1, b"/sbin/init\x00splash\x00", "init", None),
+                (2, b"", "kthreadd", None),
+                (3, None, None, None),
+                XRPLD_PROC,
+            ],
+        )
+        assert nm.find_pid("xrpld") == 4242
+
+    def test_find_pid_falls_back_to_comm(self, proc):
+        _write_proc(
+            proc,
+            procs=[
+                (1, b"/sbin/init\x00", "init", None),
+                (77, b"/usr/bin/python3\x00/opt/run.py\x00", "xrpld-main", None),
+            ],
+        )
+        assert nm.find_pid("xrpld") == 77
+
+    def test_find_pid_is_none_without_a_match(self, proc):
+        _write_proc(
+            proc,
+            procs=[
+                (1, b"/sbin/init\x00", "init", None),
+                (2, b"", "kthreadd", None),
+                (3, None, None, None),
+            ],
+        )
+        assert nm.find_pid("xrpld") is None
+
+    def test_rss_is_vmrss_in_bytes(self, proc):
+        _write_proc(proc, procs=[XRPLD_PROC])
+        assert nm.read_rss(4242) == 2048000 * 1024
+
+    def test_rss_is_none_without_a_status_or_a_vmrss_line(self, proc):
+        _write_proc(proc, procs=[(9, b"", "kthreadd", None)])
+        (proc / "9" / "status").write_text("Name:\tkthreadd\nState:\tS (sleeping)\n")
+        assert nm.read_rss(9) is None
+        assert nm.read_rss(4242) is None
+
+
+class TestProbes:
+    def test_port_open(self, rpc):
+        assert nm.port_open(rpc.port) is True
+        assert nm.port_open(_closed_port()) is False
+
+    def test_http_ok_needs_a_2xx(self, rpc):
+        assert nm.http_ok(rpc.url + "health") is True
+        assert nm.http_ok(rpc.url + "nope") is False
+        assert nm.http_ok(f"http://127.0.0.1:{_closed_port()}/health") is False
+        assert nm.http_ok("not a url") is False
+
+    def test_admin_rpc_posts_the_command_and_returns_result(self, rpc):
+        rpc.result = _server_info("full")
+        assert nm.admin_rpc(rpc.url, "server_info") == _server_info("full")
+        assert rpc.calls == [
+            ("application/json", {"method": "server_info", "params": [{}]})
+        ]
+
+    def test_admin_rpc_without_a_result_is_empty(self, rpc):
+        rpc.body = b'{"status": "error"}'
+        assert nm.admin_rpc(rpc.url, "server_info") == {}
+
+    def test_admin_rpc_is_none_on_bad_json_or_no_listener(self, rpc):
+        rpc.body = b"<html>502 Bad Gateway</html>"
+        assert nm.admin_rpc(rpc.url, "server_info") is None
+        assert nm.admin_rpc(f"http://127.0.0.1:{_closed_port()}/", "peers") is None
+
+
+class TestSample:
+    def _cfg(self, tmp_path, **over):
+        cfg = SimpleNamespace(
+            interval=10,
+            disk_path=str(tmp_path),
+            process="xrpld",
+            admin_rpc=f"http://127.0.0.1:{_closed_port()}/",
+            debugstream_health="",
+            redis_port=0,
+        )
+        cfg.__dict__.update(over)
+        return cfg
+
+    def test_row_from_a_running_node(self, tmp_path, monkeypatch, rpc):
+        tree = tmp_path / "proc"
+        _write_proc(tree, procs=[XRPLD_PROC])
+        monkeypatch.setattr(nm, "PROC", str(tree))
+        rpc.result = _server_info("full", load_factor=1, io_latency_ms=3)
+        s = nm.Sampler(
+            self._cfg(
+                tmp_path,
+                admin_rpc=rpc.url,
+                debugstream_health=rpc.url + "health",
+                redis_port=rpc.port,
+            )
+        )
+        assert s.prev_cpu == (9580, 8200, 200)
+        assert s.prev_disk == (20000 * 512, 8000 * 512)
+        assert s.prev_net == (120000, 50000)
+
+        _write_proc(
+            tree,
+            cpu=(1400, 50, 400, 8500, 300, 10, 20, 0, 0, 0),
+            sda=(20200, 8100),
+            eth0=(160000, 70000),
+            procs=[XRPLD_PROC],
+        )
+        s.prev_t = time.time() - 10
+        row = s.sample()
+
+        st = os.statvfs(str(tmp_path))
+        assert row["ts"] == pytest.approx(time.time(), abs=2)
+        assert row["cpu_pct"] == 45.45
+        assert row["cpu_iowait_pct"] == 9.09
+        assert (row["load1"], row["load5"], row["load15"]) == (0.52, 0.48, 0.40)
+        assert row["mem_total"] == 16384000 * 1024
+        assert row["mem_avail"] == 8192000 * 1024
+        assert row["mem_used"] == (16384000 - 8192000) * 1024
+        assert row["swap_total"] == 2097152 * 1024
+        assert row["swap_used"] == (2097152 - 1048576) * 1024
+        assert row["xrpld_rss"] == 2048000 * 1024
+        assert row["disk_total"] == st.f_blocks * st.f_frsize
+        assert row["disk_used"] == (st.f_blocks - st.f_bfree) * st.f_frsize
+        assert row["disk_read_bps"] == pytest.approx(200 * 512 / 10, rel=1e-3)
+        assert row["disk_write_bps"] == pytest.approx(100 * 512 / 10, rel=1e-3)
+        assert row["net_rx_bps"] == pytest.approx(60000 / 10, rel=1e-3)
+        assert row["net_tx_bps"] == pytest.approx(30000 / 10, rel=1e-3)
+        assert row["xrpld_ok"] == 1
+        assert row["debugstream_ok"] == 1
+        assert row["redis_ok"] == 1
+        assert row["server_state"] == "full"
+        assert row["build_version"] == "3.1.0"
+        assert row["validated_seq"] == 100
+        assert row["ledger_span"] == 99
+        assert row["load_factor"] == 1
+        assert row["io_latency_ms"] == 3
+        assert row["xdgm_ok"] == 0
+        assert s.latest is row
+        assert s.prev_cpu == (10680, 8800, 300)
+        assert s.prev_disk == (20200 * 512, 8100 * 512)
+        assert s.prev_net == (180000, 80000)
+        assert rpc.calls == [
+            ("application/json", {"method": "server_info", "params": [{}]})
+        ]
+
+    def test_row_without_the_process_or_sidecars(self, tmp_path, monkeypatch):
+        tree = tmp_path / "proc"
+        _write_proc(tree)
+        monkeypatch.setattr(nm, "PROC", str(tree))
+        s = nm.Sampler(self._cfg(tmp_path))
+        row = s.sample()
+        assert row["cpu_pct"] == 0.0
+        assert row["cpu_iowait_pct"] == 0.0
+        assert row["disk_read_bps"] == 0
+        assert row["disk_write_bps"] == 0
+        assert row["net_rx_bps"] == 0
+        assert row["net_tx_bps"] == 0
+        assert row["xrpld_rss"] is None
+        assert row["xrpld_ok"] == 0
+        assert row["debugstream_ok"] is None
+        assert row["redis_ok"] is None
+        assert row["server_state"] == "unreachable"
+        assert row["xdgm_ok"] == 0
+        assert "build_version" not in row
+
+
+class TestXdgmListenerLoop:
+    def test_keeps_the_newest_packet_and_waits_out_socket_errors(self, monkeypatch):
+        script = [
+            (_xdgm_packet(ledger_seq=77, server_state=4), ("10.0.0.1", 40000)),
+            (b"not a datagram", ("10.0.0.1", 40000)),
+            OSError(11, "Resource temporarily unavailable"),
+            _Stop(),
+        ]
+        bound = []
+
+        class ScriptedSocket:
+            def __init__(self, *args):
+                pass
+
+            def setsockopt(self, *args):
+                pass
+
+            def bind(self, addr):
+                bound.append(addr)
+
+            def recvfrom(self, size):
+                item = script.pop(0)
+                if isinstance(item, BaseException):
+                    raise item
+                return item
+
+        sleeps = []
+        monkeypatch.setattr(socket, "socket", ScriptedSocket)
+        monkeypatch.setattr(nm.time, "sleep", sleeps.append)
+        s = _sampler(
+            monkeypatch,
+            SimpleNamespace(interval=10, xdgm_host="0.0.0.0", xdgm_port=9999),
+        )
+        with pytest.raises(_Stop):
+            s.listen_xdgm()
+        assert bound == [("0.0.0.0", 9999)]
+        assert s.xdgm["ledger_seq"] == 77
+        assert s.xdgm["server_state"] == 4
+        assert s.xdgm_ts == pytest.approx(time.time(), abs=2)
+        assert sleeps == [1]
+        assert script == []
+
+
+class TestEnsureColumns:
+    def test_columns_from_an_earlier_schema_are_added(self):
+        conn = nm.connect(":memory:")
+        conn.executescript(
+            "CREATE TABLE samples (ts INTEGER PRIMARY KEY, cpu_pct REAL);"
+            "CREATE TABLE rollup_5m (ts INTEGER PRIMARY KEY, cpu_pct REAL);"
+            "CREATE TABLE rollup_1h (ts INTEGER PRIMARY KEY, cpu_pct REAL);"
+            "CREATE TABLE events (ts INTEGER, kind TEXT, detail TEXT);"
+        )
+        nm.ensure_columns(conn)
+        for table in ("samples", "rollup_5m", "rollup_1h"):
+            kinds = {
+                r["name"]: r["type"]
+                for r in conn.execute(f"PRAGMA table_info({table})")
+            }
+            assert set(kinds) == {"ts", *nm.NUMERIC, *nm.LAST}
+            assert kinds["xdgm_age"] == "REAL"
+            assert kinds["build_version"] == "TEXT"
+            assert kinds["xdgm_ok"] == "INTEGER"
+        nm.insert(conn, {"ts": 1, "xdgm_age": 0.5, "server_state": "full"})
+        row = conn.execute("SELECT xdgm_age, server_state FROM samples").fetchone()
+        assert tuple(row) == (0.5, "full")
+
+
+class TestSamplerLoop:
+    def test_initial_sync_is_recorded_once_per_value(self, tmp_path, monkeypatch):
+        synced = _server_info("full", initial_sync_duration_us=90_000_000)
+        restarted = _server_info("full", initial_sync_duration_us=120_000_000)
+        rows, events, _ = _run_loop(
+            tmp_path,
+            monkeypatch,
+            [(synced, None), (synced, None), (restarted, None)],
+        )
+        assert [r["initial_sync_s"] for r in rows] == [90.0, 90.0, 120.0]
+        assert events == [
+            ("initial_sync", "reached full 90s after start (1.5 min)"),
+            ("initial_sync", "reached full 120s after start (2.0 min)"),
+        ]
+
+    def test_a_failing_sample_is_recorded_and_the_loop_goes_on(
+        self, tmp_path, monkeypatch
+    ):
+        rows, events, sampler = _run_loop(
+            tmp_path,
+            monkeypatch,
+            [
+                RuntimeError("statvfs: No such file or directory"),
+                (_server_info("full"), None),
+            ],
+        )
+        assert [r["server_state"] for r in rows] == ["full"]
+        assert events == [("sampler_error", "statvfs: No such file or directory")]
+        assert sampler.tick == 2
+
+    def test_the_loop_survives_losing_the_events_table(self, tmp_path, monkeypatch):
+        class DropsEvents(_ScriptedSampler):
+            def sample(self):
+                if self.tick == 0:
+                    self.tick += 1
+                    other = nm.connect(self.cfg.db)
+                    other.execute("DROP TABLE events")
+                    other.close()
+                    raise RuntimeError("boom")
+                raise _Stop
+
+        rows, events, sampler = _run_loop(tmp_path, monkeypatch, [], DropsEvents)
+        assert rows == []
+        assert events == []
+        assert sampler.tick == 1
+
+
+class TestMain:
+    @pytest.fixture
+    def wiring(self, tmp_path, monkeypatch):
+        """main() with the threads and the HTTP server replaced by recorders."""
+        monkeypatch.setattr(nm, "PROC", _write_proc(tmp_path / "proc"))
+        threads, servers = [], []
+
+        class Thread:
+            def __init__(self, target, args=(), daemon=False):
+                self.target, self.args, self.daemon = target, args, daemon
+
+            def start(self):
+                threads.append(self)
+
+        class Server:
+            def __init__(self, address, handler):
+                servers.append((address, handler))
+
+            def serve_forever(self):
+                pass
+
+        monkeypatch.setattr(nm, "threading", SimpleNamespace(Thread=Thread))
+        monkeypatch.setattr(nm, "ThreadingHTTPServer", Server)
+        saved = (nm.Handler.cfg, nm.Handler.sampler, nm.Handler.network)
+        yield SimpleNamespace(threads=threads, servers=servers)
+        nm.Handler.cfg, nm.Handler.sampler, nm.Handler.network = saved
+
+    def _argv(self, tmp_path, **over):
+        args = {
+            "db": str(tmp_path / "state" / "metrics.db"),
+            "http-host": "127.0.0.1",
+            "http-port": "18687",
+            "interval": "5",
+            "dashboard": str(tmp_path / "dashboard.html"),
+            "admin-rpc": "http://127.0.0.1:5007/",
+            "debugstream-health": "",
+            "redis-port": "0",
+            "disk-path": str(tmp_path),
+            "process": "xrpld",
+            "xdgm-host": "127.0.0.1",
+            "xdgm-port": "9998",
+            "retain-raw-hours": "24",
+            "retain-5m-days": "7",
+            "retain-1h-days": "90",
+            "network-nodes": "vnode1=http://10.0.0.1:8687,pnode1=http://10.0.0.2:8687",
+            "network-file": str(tmp_path / "network.json"),
+            "network-name": "alphanet",
+        }
+        args.update(over)
+        argv = ["node_metrics.py"]
+        for key, value in args.items():
+            argv += [f"--{key}", value]
+        return argv
+
+    def test_main_builds_the_config_and_starts_every_part(
+        self, tmp_path, monkeypatch, wiring
+    ):
+        monkeypatch.setattr("sys.argv", self._argv(tmp_path))
+        nm.main()
+
+        cfg = nm.Handler.cfg
+        assert cfg.db == str(tmp_path / "state" / "metrics.db")
+        assert cfg.interval == 5.0
+        assert cfg.redis_port == 0
+        assert cfg.debugstream_health == ""
+        assert (cfg.retain_raw_hours, cfg.retain_5m_days, cfg.retain_1h_days) == (
+            24,
+            7,
+            90,
+        )
+        conn = nm.connect(cfg.db)
+        tables = {r["name"] for r in conn.execute("SELECT name FROM sqlite_master")}
+        conn.close()
+        assert {"samples", "rollup_5m", "rollup_1h", "events"} <= tables
+
+        sampler = nm.Handler.sampler
+        assert isinstance(sampler, nm.Sampler)
+        assert sampler.cfg is cfg
+        assert sampler.prev_cpu == (9580, 8200, 200)
+
+        assert [(t.target, t.args, t.daemon) for t in wiring.threads] == [
+            (nm.sampler_loop, (cfg, sampler), True),
+            (sampler.listen_xdgm, (), True),
+        ]
+        assert wiring.servers == [(("127.0.0.1", 18687), nm.Handler)]
+
+        network = nm.Handler.network
+        assert network.nodes == [
+            ("vnode1", "validator", "http://10.0.0.1:8687"),
+            ("pnode1", "peer", "http://10.0.0.2:8687"),
+        ]
+        assert network.name == "alphanet"
+        assert network.network_file == str(tmp_path / "network.json")
+
+    def test_xdgm_port_0_and_no_node_list_start_neither(
+        self, tmp_path, monkeypatch, wiring
+    ):
+        monkeypatch.setattr(
+            "sys.argv", self._argv(tmp_path, **{"xdgm-port": "0", "network-nodes": ""})
+        )
+        nm.main()
+        assert [t.target for t in wiring.threads] == [nm.sampler_loop]
+        assert nm.Handler.network is None
+        assert nm.Handler.cfg.xdgm_port == 0
