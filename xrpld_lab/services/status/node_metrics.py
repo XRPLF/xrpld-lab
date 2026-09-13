@@ -348,8 +348,8 @@ def http_ok(url, timeout=3):
         return False
 
 
-def admin_rpc(url, command, timeout=5):
-    body = json.dumps({"method": command, "params": [{}]}).encode()
+def admin_rpc(url, command, timeout=5, params=None):
+    body = json.dumps({"method": command, "params": [params or {}]}).encode()
     req = urllib.request.Request(
         url, data=body, headers={"Content-Type": "application/json"}
     )
@@ -554,6 +554,7 @@ class Sampler:
             "peers": info.get("peers"),
             "uptime": info.get("uptime"),
             "validated_seq": (info.get("validated_ledger") or {}).get("seq"),
+            "validator_key": info.get("pubkey_validator") if info.get("pubkey_validator") != "none" else None,
             "ledger_span": span,
             "converge_ms": round(
                 (info.get("last_close") or {}).get("converge_time_s", 0) * 1000
@@ -660,7 +661,6 @@ def table_for(window_s, cfg):
 
 # ------------------------------------------------------------------ network roll-up
 # Health per role: a validator must be proposing, everything else must be full.
-LEDGER_SECONDS = 3
 HEALTHY_STATE = {"validator": "proposing", "peer": "full"}
 
 
@@ -693,14 +693,25 @@ def fetch_latest(url, timeout=3):
         return json.loads(resp.read())
 
 
+def fetch_ledger_hash(url, index, timeout=3):
+    """The hash one node holds for ledger `index`, or None when it cannot say."""
+    try:
+        with urllib.request.urlopen(f"{url}/api/ledger?index={index}", timeout=timeout) as resp:
+            return json.loads(resp.read()).get("ledger_hash")
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+
+
 class Network:
     """Roll-up of every node's /api/latest for the network dashboard."""
 
-    def __init__(self, nodes, network_file="", name="", fetch=fetch_latest, timeout=3):
+    def __init__(self, nodes, network_file="", name="", fetch=fetch_latest,
+                 fetch_hash=fetch_ledger_hash, timeout=3):
         self.nodes = nodes
         self.network_file = network_file
         self.name = name
         self.fetch = fetch
+        self.fetch_hash = fetch_hash
         self.timeout = timeout
 
     def _node(self, name, role, url):
@@ -715,6 +726,7 @@ class Network:
             "server_state": latest.get("server_state"),
             "build_version": latest.get("build_version"),
             "validated_ledger": latest.get("validated_seq"),
+            "validator_key": latest.get("validator_key"),
             "sampled_at": latest.get("ts"),
             "peers": latest.get("peers"),
             "uptime": latest.get("uptime"),
@@ -739,18 +751,13 @@ class Network:
             max_workers=max(1, len(self.nodes))
         ) as pool:
             nodes = list(pool.map(lambda n: self._node(*n), self.nodes))
-        validators = [n for n in nodes if n["role"] == "validator"]
-        seqs = [n["validated_ledger"] for n in validators]
-        stamps = [n["sampled_at"] for n in validators if n["sampled_at"] is not None]
-        # Each sampler reads its node on its own tick, so the samples differ in age; a ledger
-        # closes about every LEDGER_SECONDS, so that age spread explains that many ledgers plus one.
-        allowed = 1 + (max(stamps) - min(stamps)) // LEDGER_SECONDS if stamps else 1
-        agreement = bool(validators) and None not in seqs and max(seqs) - min(seqs) <= allowed
+        ledger = self._ledger_check(nodes)
         return {
             "name": self.name,
             "nodes": nodes,
             "healthy": all(n["healthy"] for n in nodes),
-            "agreement": agreement,
+            "agreement": ledger["agreement"],
+            "ledger_check": ledger,
             "validated_ledger": max(
                 (
                     n["validated_ledger"]
@@ -763,6 +770,30 @@ class Network:
             "generated_at": int(time.time()),
         }
 
+    def _ledger_check(self, nodes):
+        """Every node's hash for one ledger index all of them have validated. The samples are
+        of different ages, so the lowest validated index seen is the one every node holds;
+        validators agree when they return one hash for it."""
+        seqs = [n["validated_ledger"] for n in nodes if n["validated_ledger"] is not None]
+        index = min(seqs) if seqs else None
+        hashes = {}
+        if index is not None:
+            urls = [(name, url) for name, _role, url in self.nodes]
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(urls))) as pool:
+                found = pool.map(lambda nu: self.fetch_hash(nu[1], index, self.timeout), urls)
+            hashes = {name: h for (name, _url), h in zip(urls, found)}
+        for n in nodes:
+            n["ledger_hash"] = hashes.get(n["name"])
+        validator_hashes = [n["ledger_hash"] for n in nodes if n["role"] == "validator"]
+        agreement = bool(validator_hashes) and None not in validator_hashes and len(set(validator_hashes)) == 1
+        common = validator_hashes[0] if agreement else None
+        return {
+            "index": index,
+            "hash": common,
+            "agreement": agreement,
+            "disagreeing": [n["name"] for n in nodes if index is not None and n["ledger_hash"] != common],
+        }
+
     def health(self, report=None):
         report = report or self.report()
         failing = [
@@ -770,11 +801,14 @@ class Network:
             for n in report["nodes"]
             if not n["healthy"]
         ]
+        ok = not failing and report["agreement"]
         return {
-            "ok": not failing,
+            "ok": ok,
             "failing": failing,
+            "agreement": report["agreement"],
+            "ledger_check": report["ledger_check"],
             "generated_at": report["generated_at"],
-        }, (200 if not failing else 503)
+        }, (200 if ok else 503)
 
 
 # ------------------------------------------------------------------ http
@@ -824,6 +858,8 @@ class Handler(BaseHTTPRequestHandler):
                     },
                     200 if ok else 503,
                 )
+            if route == "/api/ledger":
+                return self._ledger(query)
             if route == "/api/network" and self.network:
                 return self._json(self.network.report())
             if route == "/api/network/health" and self.network:
@@ -831,6 +867,17 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:  # a failed panel must not take the server down
             return self._json({"error": str(exc)}, 500)
         self._json({"error": "not found"}, 404)
+
+    def _ledger(self, query):
+        """The hash this node holds for one ledger index, for the network roll-up's fork check."""
+        raw = (query.get("index") or [""])[0]
+        if not raw.isdigit():
+            return self._json({"error": "index must be a ledger index"}, 400)
+        result = admin_rpc(self.cfg.admin_rpc, "ledger", params={"ledger_index": int(raw)})
+        ledger_hash = ((result or {}).get("ledger") or {}).get("ledger_hash")
+        if not ledger_hash:
+            return self._json({"index": int(raw), "error": "ledger not available"}, 404)
+        return self._json({"index": int(raw), "ledger_hash": ledger_hash})
 
     def _dashboard(self):
         try:

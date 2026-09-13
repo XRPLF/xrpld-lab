@@ -112,6 +112,11 @@
     </div>
   </section>
 
+  <section id="sec-validations">
+    <h2>Validations <span class="who">who validated the latest ledgers, live from the validations stream</span> <span id="valsum" class="meta"></span></h2>
+    <div class="panel"><div class="wrap"><table id="validations"><tr><td class="empty">waiting for validations…</td></tr></table></div></div>
+  </section>
+
   <section id="sec-nodes">
     <h2>Nodes <span class="who">for operators</span></h2>
     <div class="panel"><div class="wrap"><table id="nodes"></table></div></div>
@@ -211,14 +216,21 @@ function renderLive(data) {
   const healthy = data.healthy ?? (okV === validators.length && okP === peers.length);
   document.getElementById('health').outerHTML = `<span id="health" class="badge ${healthy ? 'ok' : (okV >= Math.ceil(validators.length * 0.8) ? 'warn' : 'bad')}">` +
     `${healthy ? '● healthy' : (okV >= Math.ceil(validators.length * 0.8) ? '▲ degraded' : '✕ down')}</span>`;
-  sampled = { validated_ledger: data.validated_ledger, okV, validators: validators.length, okP, peers: peers.length, agreement: data.agreement };
+  sampled = { validated_ledger: data.validated_ledger, okV, validators: validators.length, okP, peers: peers.length,
+              agreement: data.agreement, check: data.ledger_check || {} };
   renderStats();
 
-  document.getElementById('nodes').innerHTML = `<tr><th>Node</th><th>Role</th><th>State</th><th>Build</th><th style="text-align:right">Validated</th><th style="text-align:right">Peers</th><th style="text-align:right">Uptime</th></tr>` +
+  const check = data.ledger_check || {};
+  const bad = new Set(check.disagreeing || []);
+  document.getElementById('nodes').innerHTML = `<tr><th>Node</th><th>Role</th><th>State</th><th>Build</th><th style="text-align:right">Validated</th><th style="text-align:right">Sampled</th><th>Ledger ${fmtNum(check.index)}</th><th style="text-align:right">Peers</th><th style="text-align:right">Uptime</th></tr>` +
     nodes.map(n => `<tr><td><a href="nodes/${esc(n.name)}/">${esc(n.name)}</a></td><td>${esc(n.role)}</td>` +
       `<td>${badge(n.healthy ? stateClass(n.server_state) : 'bad', n.server_state || 'unreachable')}</td>` +
       `<td class="mono">${esc(n.build_version || '–')}</td><td class="num">${fmtNum(n.validated_ledger)}</td>` +
+      `<td class="num">${n.sampled_at == null ? '–' : `${Math.max(0, data.generated_at - n.sampled_at)}s ago`}</td>` +
+      `<td>${n.ledger_hash ? badge(bad.has(n.name) ? 'bad' : 'ok', n.ledger_hash.slice(0, 12)) : badge('bad', 'no answer')}</td>` +
       `<td class="num">${fmtNum(n.peers)}</td><td class="num">${fmtUptime(n.uptime)}</td></tr>`).join('');
+  validatorNames = Object.fromEntries(nodes.filter(n => n.validator_key).map(n => [n.validator_key, n.name]));
+  renderValidations();
 
   const live = { build_version: (nodes.find(n => n.build_version) || {}).build_version };
   renderNetwork(data.network || {}, live);
@@ -243,7 +255,9 @@ function renderStats() {
     ['Reserve', chain.reserve == null ? '–' : `${fmtNum(chain.reserve / 1e6)}<small> XRP</small>`],
     ['Validators', s.validators == null ? '–' : `${s.okV}<small> / ${s.validators}</small>`],
     ['Peers', s.peers == null ? '–' : `${s.okP}<small> / ${s.peers}</small>`],
-    ['Agreement', s.agreement == null ? '–' : badge(s.agreement ? 'ok' : 'bad', s.agreement ? 'in sync' : 'diverged')],
+    ['Agreement', s.agreement == null ? '–' : badge(s.agreement ? 'ok' : 'bad', s.agreement ? 'in sync' : 'diverged') +
+      (s.check?.index ? `<small> ledger ${fmtNum(s.check.index)}${s.check.hash ? ' ' + s.check.hash.slice(0, 8) : ''}</small>` : '')],
+    ['Validations', valSummary()],
   ].map(([k, v]) => `<div class="stat"><div class="k">${k}</div><div class="v">${v}</div></div>`).join('');
   const link = { live: ['ok', 'live'], connecting: ['dim', 'connecting'], reconnecting: ['warn', 'reconnecting'] }[chain.link];
   document.getElementById('ws').outerHTML = `<span id="ws" class="badge ${link[0]}">${{ok:'●',warn:'▲',dim:'·'}[link[0]]} ${link[1]}</span>`;
@@ -256,6 +270,61 @@ function closeAge() {
 }
 setInterval(() => { const el = document.getElementById('stat-close'); if (el) el.innerHTML = closeAge(); }, 1000);
 
+// Validations: one row per validator key seen on the stream; the roll-up maps keys to node
+// names. "Behind" is the gap to the newest index any validator has validated.
+let validatorNames = {};
+const validations = {};  // key -> { index, hash, full, at }
+const hashesByIndex = new Map();  // index -> Map(key -> hash), last 64 indexes
+function onValidation(m) {
+  const key = m.master_key || m.validation_public_key;
+  const index = Number(m.ledger_index);
+  if (!key || !Number.isFinite(index)) return;
+  validations[key] = { index, hash: m.ledger_hash, full: m.full !== false, at: Date.now(), ephemeral: m.validation_public_key };
+  if (!hashesByIndex.has(index)) hashesByIndex.set(index, new Map());
+  hashesByIndex.get(index).set(key, m.ledger_hash);
+  for (const k of hashesByIndex.keys()) if (k < index - 64) hashesByIndex.delete(k);
+  renderValidations();
+}
+function majorityHash(index) {
+  const counts = {};
+  for (const h of (hashesByIndex.get(index) || new Map()).values()) counts[h] = (counts[h] || 0) + 1;
+  return Object.entries(counts).sort((a, b) => b[1] - a[1])[0]?.[0];
+}
+// A validator counts as agreeing when its latest validation carries the majority hash for that
+// index and is at most one ledger behind the newest index seen (one validation is always in flight).
+function valSummary() {
+  const keys = Object.keys(validations);
+  if (!keys.length) return '<span id="stat-validations">–</span>';
+  const top = Math.max(...keys.map(k => validations[k].index));
+  const agree = keys.filter(k => validations[k].index >= top - 1 && validations[k].hash === majorityHash(validations[k].index)).length;
+  const total = Math.max(keys.length, sampled.validators || 0);
+  return `<span id="stat-validations">${agree}<small> / ${total} on ${fmtNum(top)}</small></span>`;
+}
+function renderValidations() {
+  const keys = Object.keys(validations);
+  const el = document.getElementById('validations');
+  if (!keys.length) return;
+  const top = Math.max(...keys.map(k => validations[k].index));
+  const known = Object.entries(validatorNames).filter(([k]) => !validations[k]).map(([k, name]) => ({ key: k, name, silent: true }));
+  const rows = keys.map(k => ({ key: k, name: validatorNames[k], ...validations[k] })).concat(known)
+    .sort((a, b) => (a.name || a.key).localeCompare(b.name || b.key));
+  el.innerHTML = `<tr><th>Validator</th><th>Key</th><th style="text-align:right">Last validated</th><th>Hash</th><th style="text-align:right">Behind</th><th style="text-align:right">Age</th><th>Status</th></tr>` +
+    rows.map(r => {
+      if (r.silent) return `<tr><td>${esc(r.name)}</td><td class="mono">${esc(r.key.slice(0, 12))}…</td><td class="num">–</td><td>–</td><td class="num">–</td><td class="num">–</td><td>${badge('warn', 'no validations seen')}</td></tr>`;
+      const behind = top - r.index, age = Math.round((Date.now() - r.at) / 1000);
+      const majority = majorityHash(r.index), forked = majority && r.hash !== majority;
+      const status = forked ? badge('bad', 'different hash') : !r.full ? badge('warn', 'partial') : age > 30 ? badge('bad', 'silent') :
+        behind > 1 || age > 12 ? badge('warn', 'behind') : badge('ok', 'validating');
+      return `<tr><td>${r.name ? esc(r.name) : '<span class="empty">unknown</span>'}</td><td class="mono">${esc(r.key.slice(0, 12))}…</td>` +
+        `<td class="num">${fmtNum(r.index)}</td><td class="mono">${esc((r.hash || '').slice(0, 12))}</td>` +
+        `<td class="num">${behind === 0 ? '<span class="empty">current</span>' : behind}</td><td class="num">${age}s</td><td>${status}</td></tr>`;
+    }).join('');
+  document.getElementById('valsum').textContent = `${keys.length} validators seen · latest ${fmtNum(top)}`;
+  const stat = document.getElementById('stat-validations');
+  if (stat) stat.outerHTML = valSummary();
+}
+setInterval(renderValidations, 2000);
+
 let streamUrl = null;
 function connectLedgerStream(endpoint) {
   const url = endpoint || `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}`;
@@ -267,11 +336,12 @@ function connectLedgerStream(endpoint) {
     sock.onopen = () => {
       delay = 1000;
       chain.link = 'live';
-      sock.send(JSON.stringify({ id: 'subscribe', command: 'subscribe', streams: ['ledger', 'server'] }));
+      sock.send(JSON.stringify({ id: 'subscribe', command: 'subscribe', streams: ['ledger', 'server', 'validations'] }));
       renderStats();
     };
     sock.onmessage = ev => {
       const m = JSON.parse(ev.data);
+      if (m.type === 'validationReceived') return onValidation(m);
       const ledger = m.type === 'ledgerClosed' ? m : (m.id === 'subscribe' && m.result) ? m.result : null;
       if (!ledger || ledger.ledger_index == null) return;
       chain.seq = ledger.ledger_index;

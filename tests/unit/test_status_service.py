@@ -102,15 +102,29 @@ class TestParseNetworkNodes:
             nm.parse_network_nodes("vnode1=http://a:1 colour=red")
 
 
+def _fake_hash(table, hashes=None):
+    """fetch_ledger_hash stand-in: a node that answers /api/latest returns its hash for any
+    index (the same chain hash unless `hashes` names a different one for that URL)."""
+    hashes = hashes or {}
+
+    def fetch(url, index, timeout):
+        if url not in table:
+            return None
+        return hashes.get(url, f"HASH{index}")
+
+    return fetch
+
+
 class TestNetworkReport:
-    def _network(self, table, tmp_path=None, network=None):
+    def _network(self, table, tmp_path=None, network=None, hashes=None):
         path = ""
         if tmp_path is not None:
             path = str(tmp_path / "network.json")
             if network is not None:
                 (tmp_path / "network.json").write_text(json.dumps(network))
         return nm.Network(
-            NODES, network_file=path, name="alphanet", fetch=_fake_fetch(table)
+            NODES, network_file=path, name="alphanet", fetch=_fake_fetch(table),
+            fetch_hash=_fake_hash(table, hashes),
         )
 
     def test_agreement_when_every_validator_reports_the_same_ledger(self):
@@ -122,6 +136,8 @@ class TestNetworkReport:
             }
         ).report()
         assert report["agreement"] is True
+        assert report["ledger_check"] == {"index": 499, "hash": "HASH499", "agreement": True, "disagreeing": []}
+        assert [n["ledger_hash"] for n in report["nodes"]] == ["HASH499"] * 3
         assert report["validated_ledger"] == 500
         assert report["name"] == "alphanet"
         assert [n["name"] for n in report["nodes"]] == ["vnode1", "vnode2", "pnode1"]
@@ -136,7 +152,7 @@ class TestNetworkReport:
         assert vnode1["error"] is None
         assert isinstance(report["generated_at"], int)
 
-    def test_no_agreement_when_validators_differ(self):
+    def test_agreement_despite_sample_skew_when_hashes_match(self):
         report = self._network(
             {
                 "http://10.0.0.1:8687": _latest("proposing", 500),
@@ -144,7 +160,21 @@ class TestNetworkReport:
                 "http://127.0.0.1:8687": _latest("full", 500),
             }
         ).report()
+        assert report["agreement"] is True
+        assert report["ledger_check"]["index"] == 498
+
+    def test_no_agreement_when_a_validator_holds_another_hash(self):
+        report = self._network(
+            {
+                "http://10.0.0.1:8687": _latest("proposing", 500),
+                "http://10.0.0.2:8687": _latest("proposing", 500),
+                "http://127.0.0.1:8687": _latest("full", 500),
+            },
+            hashes={"http://10.0.0.2:8687": "FORK500"},
+        ).report()
         assert report["agreement"] is False
+        assert report["ledger_check"]["hash"] is None
+        assert report["ledger_check"]["disagreeing"] == ["vnode1", "vnode2", "pnode1"]
 
     def test_no_agreement_when_a_validator_is_unreachable(self):
         report = self._network(
@@ -184,8 +214,22 @@ class TestNetworkReport:
 
 
 class TestNetworkHealth:
-    def _health(self, table):
-        return nm.Network(NODES, fetch=_fake_fetch(table)).health()
+    def _health(self, table, hashes=None):
+        return nm.Network(NODES, fetch=_fake_fetch(table), fetch_hash=_fake_hash(table, hashes)).health()
+
+    def test_503_when_validators_disagree_on_a_ledger_hash(self):
+        body, code = self._health(
+            {
+                "http://10.0.0.1:8687": _latest("proposing"),
+                "http://10.0.0.2:8687": _latest("proposing"),
+                "http://127.0.0.1:8687": _latest("full"),
+            },
+            hashes={"http://10.0.0.1:8687": "FORK"},
+        )
+        assert code == 503
+        assert body["ok"] is False
+        assert body["failing"] == []
+        assert body["agreement"] is False
 
     def test_200_when_validators_propose_and_peers_are_full(self):
         body, code = self._health(
@@ -234,7 +278,7 @@ class TestNetworkRoutes:
             "http://127.0.0.1:8687": _latest("full"),
         }
         nm.Handler.network = nm.Network(
-            NODES, name="alphanet", fetch=_fake_fetch(table)
+            NODES, name="alphanet", fetch=_fake_fetch(table), fetch_hash=_fake_hash(table)
         )
         srv = ThreadingHTTPServer(("127.0.0.1", 0), nm.Handler)
         threading.Thread(target=srv.serve_forever, daemon=True).start()
