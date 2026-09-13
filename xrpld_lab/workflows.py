@@ -488,7 +488,7 @@ class LabRunner:
                 shutil.copy2(entrypoint_src, os.path.join(node_dir, "entrypoint"))
 
             # Compose service
-            compose.add_node_service(node_name, node.ports, node.role, network=True)
+            compose.add_node_service(node_name, node.ports, node.role)
 
         for i in range(1, lab.num_peers + 1):
             node_name = f"pnode{i}"
@@ -569,7 +569,7 @@ class LabRunner:
                 shutil.copy2(entrypoint_src, os.path.join(node_dir, "entrypoint"))
 
             # Compose service
-            compose.add_node_service(node_name, node.ports, node.role, network=True)
+            compose.add_node_service(node_name, node.ports, node.role)
 
         # 8. VL + explorer services
         compose.add_vl_service()

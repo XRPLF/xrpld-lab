@@ -11,6 +11,7 @@ import os
 import pytest
 
 from xrpld_lab.ledger_generator import (
+    _main,
     account_index,
     currency_to_bytes,
     generate,
@@ -172,3 +173,73 @@ class TestMergeIntoGenesis:
 
         root = [e for e in _account_roots(merged) if e["Account"] == ROOT_ACCOUNT][0]
         assert int(root["Balance"]) == TOTAL_COINS
+
+
+class TestMain:
+    """``python -m xrpld_lab.ledger_generator`` writes the state and seed files."""
+
+    def test_writes_state_and_wallets(self, tmp_path, capsys):
+        state = tmp_path / "state.json"
+        wallets = tmp_path / "wallets.sub.1.json"
+
+        _main(
+            [
+                "--accounts",
+                "3",
+                "--trustlines",
+                "1",
+                "--out-state",
+                str(state),
+                "--out-wallets",
+                str(wallets),
+            ]
+        )
+
+        expected_states, expected_seeds = generate(3, "1000000000", 1, "USD")
+        assert json.loads(state.read_text()) == expected_states
+        assert json.loads(wallets.read_text()) == expected_seeds
+        out = capsys.readouterr().out
+        assert f"wrote 3 accounts + 1 trustlines -> {state}" in out
+        assert f"wrote 3 seeds -> {wallets}" in out
+
+    def test_balance_currency_and_prefix_reach_the_entries(self, tmp_path):
+        state = tmp_path / "state.json"
+        wallets = tmp_path / "wallets.sub.1.json"
+
+        _main(
+            [
+                "--accounts",
+                "2",
+                "--trustlines",
+                "1",
+                "--balance",
+                "5000000",
+                "--currency",
+                "EUR",
+                "--prefix",
+                "lab-",
+                "--out-state",
+                str(state),
+                "--out-wallets",
+                str(wallets),
+            ]
+        )
+
+        states = json.loads(state.read_text())
+        seeds = json.loads(wallets.read_text())
+        expected_states, expected_seeds = generate(2, "5000000", 1, "EUR", b"lab-")
+        assert states == expected_states
+        assert seeds == expected_seeds
+        assert [e["Balance"] for e in states if e["LedgerEntryType"] == "AccountRoot"]
+        assert all(
+            e["Balance"] == "5000000"
+            for e in states
+            if e["LedgerEntryType"] == "AccountRoot"
+        )
+        (trustline,) = [e for e in states if e["LedgerEntryType"] == "RippleState"]
+        assert trustline["Balance"]["currency"] == "EUR"
+        assert seeds != generate(2, "5000000", 1, "EUR")[1]
+
+    def test_accounts_and_output_paths_are_required(self):
+        with pytest.raises(SystemExit):
+            _main(["--accounts", "1"])

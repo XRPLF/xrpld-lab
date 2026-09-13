@@ -21,6 +21,14 @@ from xrpld_lab.models import (
     AnsibleConfig,
     ServicesHost,
     StatusConfig,
+    NginxConfig,
+    VlConfig,
+    RedisConfig,
+    FaucetConfig,
+    StreamConfig,
+    DebugConfig,
+    CompilerConfig,
+    GcpConfig,
 )
 
 
@@ -346,3 +354,57 @@ class TestDatagramMonitorFor:
         assert ansible.status_host.name == "pnode1"
         assert "status" in ansible.services[0].enabled_services
         assert self._ansible(None).status_host is None
+
+
+class TestPortSetUnknownRole:
+    def test_unknown_role_raises(self):
+        with pytest.raises(ValueError, match="Unknown node role"):
+            PortSet.for_node(1, "bogus")
+
+
+class TestServicesHostEnabledServices:
+    def test_empty_without_services(self):
+        assert ServicesHost(ip="10.0.0.10", name="infra").enabled_services == []
+
+    def test_every_service_in_render_order(self):
+        host = ServicesHost(
+            ip="10.0.0.10",
+            name="infra",
+            nginx=NginxConfig(domain="example.test"),
+            vl=VlConfig(),
+            redis=RedisConfig(),
+            faucet=FaucetConfig(),
+            stream=StreamConfig(),
+            debug=DebugConfig(),
+            compiler=CompilerConfig(),
+            status=StatusConfig(),
+        )
+        assert host.enabled_services == [
+            "nginx",
+            "status",
+            "redis",
+            "faucet",
+            "stream",
+            "debug",
+            "compiler",
+        ]
+
+    def test_vl_alone_is_not_a_service(self):
+        host = ServicesHost(ip="10.0.0.10", name="infra", vl=VlConfig())
+        assert host.enabled_services == []
+
+
+class TestGcpConfig:
+    def test_region_is_the_first_validator_zone_without_its_letter(self):
+        assert GcpConfig(project="perf").region == "us-central1"
+        gcp = GcpConfig(project="perf", validator_zones=["europe-west1-b"])
+        assert gcp.region == "europe-west1"
+
+    def test_node_counts_follow_the_zone_lists(self):
+        gcp = GcpConfig(project="perf")
+        assert gcp.num_validators == 5
+        assert gcp.num_peers == 4
+        custom = GcpConfig(
+            project="perf", validator_zones=["asia-east1-a"], peer_zones=[]
+        )
+        assert (custom.num_validators, custom.num_peers) == (1, 0)

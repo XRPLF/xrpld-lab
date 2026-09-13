@@ -14,6 +14,7 @@ import yaml
 from xrpld_lab import cli
 from xrpld_lab.amendments import _amendment_name_hash
 from xrpld_lab.config import parse_xrpld_cfg
+from xrpld_lab.ledger_generator import generate
 from xrpld_lab.source_resolver import SourceResolver
 from xrpld_lab.workflows import LabRunner
 from xrpld_lab.workspace import Workspace
@@ -443,3 +444,73 @@ class TestConfigOverrides:
         assert cfg["transaction_queue"]["ledgers_in_queue"] == "50"
         assert cfg["transaction_queue"]["maximum_txn_in_ledger"] == "5000"
         assert "network_id" in cfg
+
+
+# ---------------------------------------------------------------------------
+# Prefunded genesis (--preload_*)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def preloaded_network_tree(tmp_path):
+    lab = _lab_config(
+        [
+            "create:network",
+            "--num_validators",
+            "2",
+            "--num_peers",
+            "1",
+            "--genesis",
+            "True",
+            "--workspace",
+            str(tmp_path),
+            "--preload_accounts",
+            "3",
+            "--preload_trustlines",
+            "2",
+            "--preload_balance",
+            "2500000000",
+            "--preload_currency",
+            "EUR",
+        ]
+    )
+    with (
+        patch.object(SourceResolver, "resolve_features", return_value=FEATURES_MACRO),
+        patch("xrpld_lab.workflows.PublisherClient", FakePublisherClient),
+        patch("xrpld_lab.workflows.ValidatorClient", FakeValidatorClient),
+    ):
+        LabRunner(lab, Workspace(base=str(tmp_path))).run()
+    return tmp_path / "3.3.0-cluster"
+
+
+class TestPreloadedGenesisRender:
+    def test_every_node_genesis_carries_the_prefunded_state(
+        self, preloaded_network_tree
+    ):
+        entries, _ = generate(3, "2500000000", 2, "EUR")
+        for node in NETWORK_NODES:
+            genesis = json.loads(
+                (preloaded_network_tree / node / "genesis.json").read_text()
+            )
+            state = genesis["ledger"]["accountState"]
+            indexes = {e.get("index") for e in state}
+            assert all(e["index"] in indexes for e in entries)
+            roots = [e for e in state if e["LedgerEntryType"] == "AccountRoot"]
+            assert len(roots) == 4
+            assert sum(int(e["Balance"]) for e in roots) == int(
+                genesis["ledger"]["total_coins"]
+            )
+            lines = [e for e in state if e["LedgerEntryType"] == "RippleState"]
+            assert [line["Balance"]["currency"] for line in lines] == ["EUR", "EUR"]
+            assert _amendments(genesis) == [_amendment_name_hash(SUPPORTED_FEATURE)]
+
+    def test_wallet_seeds_are_written_for_the_loadtester(self, preloaded_network_tree):
+        _, seeds = generate(3, "2500000000", 2, "EUR")
+        written = json.loads(
+            (preloaded_network_tree / "wallets.sub.1.json").read_text()
+        )
+        assert written == seeds
+
+    def test_unpreloaded_network_writes_no_wallet_file(self, network_tree):
+        _, cluster = network_tree
+        assert not (cluster / "wallets.sub.1.json").exists()

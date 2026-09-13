@@ -34,51 +34,28 @@ class ComposeBuilder:
         name: str,
         ports: PortSet,
         role: NodeRole,
-        network: bool = True,
     ) -> ComposeBuilder:
         """Add an xrpld node service (validator or peer).
 
-        For network mode (network=True):
         - build context is the node directory name, dockerfile "Dockerfile"
         - platform: linux/x86_64
         - port mappings for all 5 ports
         - volumes: ./name/config, ./name/log, ./name/lib -> /opt/ripple/*,
           ./name/db -> /var/lib/xrpld/db
-
-        For standalone mode (network=False):
-        - build context: ".", dockerfile: "Dockerfile"
-        - platform: linux/x86_64
-        - port mappings
-        - volumes: ${PWD}/protocol/config -> /etc/opt/ripple, etc.
         """
-        if network:
-            self.services[name] = {
-                "build": {"context": name, "dockerfile": "Dockerfile"},
-                "platform": "linux/x86_64",
-                "container_name": name,
-                "ports": self._port_mappings(ports),
-                "volumes": [
-                    f"./{name}/config:/opt/ripple/config",
-                    f"./{name}/log:/opt/ripple/log",
-                    f"./{name}/lib:/opt/ripple/lib",
-                    f"./{name}/db:/var/lib/xrpld/db",
-                ],
-                "networks": [self.network_name],
-            }
-        else:
-            pwd = "${PWD}"
-            self.services[name] = {
-                "build": {"context": ".", "dockerfile": "Dockerfile"},
-                "platform": "linux/x86_64",
-                "container_name": name,
-                "ports": self._port_mappings(ports),
-                "volumes": [
-                    f"{pwd}/{name}/config:/etc/opt/ripple",
-                    f"{pwd}/{name}/log:/opt/ripple/log",
-                    f"{pwd}/{name}/lib:/opt/ripple/lib",
-                ],
-                "networks": [self.network_name],
-            }
+        self.services[name] = {
+            "build": {"context": name, "dockerfile": "Dockerfile"},
+            "platform": "linux/x86_64",
+            "container_name": name,
+            "ports": self._port_mappings(ports),
+            "volumes": [
+                f"./{name}/config:/opt/ripple/config",
+                f"./{name}/log:/opt/ripple/log",
+                f"./{name}/lib:/opt/ripple/lib",
+                f"./{name}/db:/var/lib/xrpld/db",
+            ],
+            "networks": [self.network_name],
+        }
         return self
 
     def add_standalone_service(
