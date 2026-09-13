@@ -296,6 +296,112 @@ class TestNetworkRender:
 
 
 # ---------------------------------------------------------------------------
+# Local (native processes)
+# ---------------------------------------------------------------------------
+
+LOCAL_CLUSTER = "local-xrpl-cluster"
+
+
+def _run_local(tmp_path, extra):
+    """Render a two-validator, one-peer local network; GitHub is never reached."""
+    lab = _lab_config(
+        ["create:network", "--local", "--num_validators", "2", "--num_peers", "1"]
+        + extra
+    )
+    with (
+        patch.object(
+            SourceResolver,
+            "resolve_features",
+            side_effect=AssertionError("fetched from GitHub"),
+        ),
+        patch("xrpld_lab.workflows.PublisherClient", FakePublisherClient),
+        patch("xrpld_lab.workflows.ValidatorClient", FakeValidatorClient),
+    ):
+        LabRunner(lab, Workspace(base=str(tmp_path))).run()
+    return tmp_path / LOCAL_CLUSTER
+
+
+@pytest.fixture
+def local_inputs(tmp_path):
+    features = tmp_path / "features.macro"
+    features.write_bytes(FEATURES_MACRO)
+    binary = tmp_path / "xrpld-build"
+    binary.write_text("#!/bin/sh\necho built\n")
+    return features, binary
+
+
+@pytest.fixture
+def local_tree(tmp_path, local_inputs):
+    features, binary = local_inputs
+    cluster = _run_local(
+        tmp_path, ["--features_file", str(features), "--binary_path", str(binary)]
+    )
+    return binary, cluster
+
+
+class TestLocalRender:
+    def test_genesis_enables_the_features_file_amendments(self, local_tree):
+        _, cluster = local_tree
+        for node in NETWORK_NODES:
+            genesis = json.loads(
+                (cluster / node / "config" / "genesis.json").read_text()
+            )
+            assert _amendments(genesis) == [_amendment_name_hash(SUPPORTED_FEATURE)]
+
+    def test_binary_path_is_staged_executable(self, local_tree):
+        binary, cluster = local_tree
+        staged = cluster / "xrpld"
+        assert staged.read_text() == binary.read_text()
+        assert os.access(staged, os.X_OK)
+
+    def test_missing_features_file_leaves_no_directory(self, tmp_path, local_inputs):
+        _, binary = local_inputs
+        with pytest.raises(FileNotFoundError):
+            _run_local(
+                tmp_path,
+                [
+                    "--features_file",
+                    str(tmp_path / "absent.macro"),
+                    "--binary_path",
+                    str(binary),
+                ],
+            )
+        assert not (tmp_path / LOCAL_CLUSTER).exists()
+
+    def test_missing_binary_leaves_no_directory(self, tmp_path, local_inputs):
+        features, _ = local_inputs
+        with pytest.raises(FileNotFoundError, match="binary not found"):
+            _run_local(
+                tmp_path,
+                [
+                    "--features_file",
+                    str(features),
+                    "--binary_path",
+                    str(tmp_path / "absent"),
+                ],
+            )
+        assert not (tmp_path / LOCAL_CLUSTER).exists()
+
+    def test_build_directory_is_the_fallback(self, tmp_path, monkeypatch):
+        checkout = tmp_path / "rippled"
+        macro = checkout / "include" / "xrpl" / "protocol" / "detail" / "features.macro"
+        macro.parent.mkdir(parents=True)
+        macro.write_bytes(FEATURES_MACRO)
+        build = checkout / "build"
+        build.mkdir()
+        (build / "xrpld").write_text("#!/bin/sh\n")
+        monkeypatch.chdir(build)
+
+        cluster = _run_local(tmp_path / "workspace", [])
+
+        assert (cluster / "xrpld").read_text() == "#!/bin/sh\n"
+        genesis = json.loads(
+            (cluster / "vnode1" / "config" / "genesis.json").read_text()
+        )
+        assert _amendments(genesis) == [_amendment_name_hash(SUPPORTED_FEATURE)]
+
+
+# ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
 

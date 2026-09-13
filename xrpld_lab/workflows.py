@@ -12,6 +12,8 @@ import os
 import shutil
 from typing import List
 
+import requests
+
 from xrpld_publisher.publisher import PublisherClient
 from xrpld_publisher.validator import ValidatorClient
 
@@ -89,6 +91,32 @@ class LabRunner:
             return get_feature_lines_from_path(local)
         feature_content = self.resolver.resolve_features(source, spec)
         return get_feature_lines_from_content(feature_content)
+
+    def _resolve_local_feature_lines(self, source, spec):
+        """Local-mode feature lines: ``--features_file``, else GitHub at the
+        commit ref, else ``../<feature path>`` of the build directory the
+        command runs in."""
+        if self.lab.features_file:
+            return self._resolve_feature_lines(source, spec)
+        if source.commit_hash:
+            try:
+                return self._resolve_feature_lines(source, spec)
+            except requests.RequestException as exc:
+                print(
+                    f"  [xrpld-lab] could not fetch features at "
+                    f"{source.commit_hash} ({exc}); looking for a build "
+                    "directory instead"
+                )
+        for fpath in spec.feature_paths:
+            candidate = os.path.join("..", fpath)
+            if os.path.exists(candidate):
+                print(f"  [xrpld-lab] reading features from {candidate}")
+                return get_feature_lines_from_path(candidate)
+        raise FileNotFoundError(
+            "no features.macro: pass --features_file, or --build_server "
+            "<github tree url> with --build_version <commit>, or run from a "
+            "rippled build directory"
+        )
 
     def _preload_entries(self):
         if not getattr(self.lab, "preload_accounts", 0):
@@ -656,7 +684,7 @@ class LabRunner:
     def _run_local_network(self):
         """Execute local network workflow:
 
-        1. Resolve features from local source files
+        1. Resolve features and the binary before the cluster directory exists
         2. Create VL keys
         3. Create validator keys
         4. Create NodeConfigs for local validators and peers
@@ -671,26 +699,21 @@ class LabRunner:
 
         name = f"local-{lab.protocol.value}"
         protocol_name = lab.protocol.value
+        binary_name = lab.binary_name
+
+        # 1. Resolve every input before the cluster directory exists
+        feature_lines = self._resolve_local_feature_lines(lab.build_source, spec)
+        binary_src = os.path.abspath(
+            lab.build_source.binary_path or os.path.join(os.getcwd(), binary_name)
+        )
+        if not os.path.isfile(binary_src):
+            raise FileNotFoundError(f"binary not found: {binary_src}")
         cluster_dir = self.workspace.cluster_dir(name)
 
-        # 0. Copy binary into cluster dir so start.sh can find it
-        binary_name = lab.binary_name
-        binary_src = lab.build_source.binary_path or os.path.join(
-            os.getcwd(), binary_name
-        )
-        binary_src = os.path.abspath(binary_src)
+        # Copy the binary into the cluster dir so start.sh finds it
         binary_dest = os.path.join(cluster_dir, binary_name)
-        if os.path.isfile(binary_src):
-            shutil.copy2(binary_src, binary_dest)
-            os.chmod(binary_dest, 0o755)
-
-        # 1. Resolve features from local source
-        feature_lines: list = []
-        for fpath in spec.feature_paths:
-            candidate = os.path.join("..", fpath)
-            if os.path.exists(candidate):
-                feature_lines = get_feature_lines_from_path(candidate)
-                break
+        shutil.copy2(binary_src, binary_dest)
+        os.chmod(binary_dest, 0o755)
 
         # 2-3. Create VL + validator keys
         original_dir = os.getcwd()

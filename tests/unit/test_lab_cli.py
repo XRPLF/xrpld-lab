@@ -443,6 +443,24 @@ class TestBuildLabConfigNetwork:
         cfg = build_lab_config(args)
         assert cfg.mode == DeployMode.LOCAL
 
+    def test_local_binary_path_lands_in_the_build_source(self):
+        cfg = build_lab_config(
+            self._parse("--local", "--binary_path", "/opt/builds/xrpld")
+        )
+        assert cfg.build_source.binary_path == "/opt/builds/xrpld"
+        assert cfg.build_source.build_type == BuildType.BINARY
+
+    def test_local_without_binary_path_leaves_it_empty(self):
+        cfg = build_lab_config(self._parse("--local"))
+        assert cfg.build_source.binary_path == ""
+        assert cfg.build_source.build_type == BuildType.BINARY
+
+    def test_local_features_file_passes_through(self):
+        cfg = build_lab_config(
+            self._parse("--local", "--features_file", "/src/features.macro")
+        )
+        assert cfg.features_file == "/src/features.macro"
+
     # -- image for xrpl --
 
     def test_xrpl_network_defaults_to_the_release_image(self):
