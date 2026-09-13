@@ -953,4 +953,10 @@ def _deploy_ansible(workspace: Workspace, name: str) -> bool:
         print("Run 'xrpld-lab create:ansible' first to generate deployment files.")
         return False
 
+    # ansible refuses non-blocking stdio, which a parent process can leave on the inherited fds
+    for fd in (0, 1, 2):
+        try:
+            os.set_blocking(fd, True)
+        except OSError:
+            pass
     return subprocess.run(["bash", run_sh], cwd=ansible_dir).returncode == 0
