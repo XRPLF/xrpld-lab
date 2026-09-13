@@ -247,4 +247,4 @@ poetry run pytest tests
 
 ## License
 
-See repository for license details.
+ISC. See [LICENSE](LICENSE).
