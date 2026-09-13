@@ -244,13 +244,13 @@ class AnsibleBuilder:
                 "ALLOY_NODE": a.node_label(node.name),
                 "ALLOY_PUSH_HOST": a.push_host,
                 "ALLOY_USERNAME": creds["username"],
-                "ALLOY_PASSWORD": creds["password"],
                 # Sidecar shares the node's netns, so both ends of the StatsD hop are
                 # the same loopback the node's [insight] stanza points at.
                 "ALLOY_STATSD_LISTEN": statsd,
-                "ALLOY_RIPPLED_STATSD_ADDRESS": statsd,
-                "ALLOY_STATSD_RELAY_ADDR": a.statsd_relay_addr,
+                "ALLOY_XRPLD_STATSD_ADDRESS": statsd,
             },
+            # The image reads the push password from a mounted file, never from the environment.
+            "alloy_password": creds["password"],
             "alloy_rippled_config": a.rippled_config_path,
             "alloy_rippled_log_dir": a.rippled_log_dir,
         }
@@ -942,15 +942,18 @@ _ALLOY_YML = """---
     copy:
       src: alloy/
       dest: /opt/xrpl-monitoring/
-  - name: Build the Alloy image
-    docker_image:
-      name: "{{ alloy_image }}"
-      source: build
-      force_source: yes
-      build:
-        path: /opt/xrpl-monitoring
-        dockerfile: docker/alloy.Dockerfile
-        pull: no
+  - name: Build the Alloy image (the Dockerfile needs BuildKit, which docker_image cannot use)
+    command: docker build -q -f docker/alloy.Dockerfile -t "{{ alloy_image }}" .
+    args:
+      chdir: /opt/xrpl-monitoring
+    environment:
+      DOCKER_BUILDKIT: "1"
+  - name: Write the push password for the sidecar
+    copy:
+      content: "{{ alloy_password }}"
+      dest: /etc/xrpl-monitoring/alloy.password
+      mode: "0600"
+    no_log: true
   - name: Wait for the node to write its perf log (the Alloy preflight requires it)
     wait_for:
       path: "{{ alloy_rippled_log_dir }}/perf.log"
@@ -962,10 +965,12 @@ _ALLOY_YML = """---
       image: "{{ alloy_image }}"
       network_mode: "container:{{ docker_container_name }}"
       volumes:
-        - "{{ alloy_rippled_config }}:/rippled-config/rippled.cfg:ro"
-        - "{{ alloy_rippled_log_dir }}:/rippled-logs:ro"
+        - "{{ alloy_rippled_config }}:/xrpld-config/xrpld.cfg:ro"
+        - "{{ alloy_rippled_log_dir }}:/xrpld-logs:ro"
+        - "/etc/xrpl-monitoring/alloy.password:/run/secrets/xrpl_monitoring_password:ro"
         - "alloy-data-{{ docker_container_name }}:/var/lib/alloy/data"
       env: "{{ alloy_env_variables }}"
+      command: run --server.http.listen-addr=127.0.0.1:12345 --storage.path=/var/lib/alloy/data /etc/alloy/config.alloy
       state: started
       restart_policy: always
       recreate: yes

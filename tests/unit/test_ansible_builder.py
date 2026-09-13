@@ -1281,6 +1281,9 @@ class TestAlloySidecar:
         builder.write()
         content = open(os.path.join(builder.ansible_dir, "alloy.yml")).read()
         assert 'network_mode: "container:{{ docker_container_name }}"' in content
+        assert "DOCKER_BUILDKIT" in content
+        assert "/run/secrets/xrpl_monitoring_password:ro" in content
+        assert "/xrpld-config/xrpld.cfg:ro" in content
 
     def test_build_context_copied(self, tmp_path):
         builder = self._builder(tmp_path, self._alloy(tmp_path))
@@ -1304,7 +1307,8 @@ class TestAlloySidecar:
             env["ALLOY_PUSH_HOST"] == "xrpl-monitoring-push-staging.aws.peersyst.tech"
         )
         assert env["ALLOY_USERNAME"] == "alphanet"
-        assert env["ALLOY_PASSWORD"] == "s3cret"
+        assert "ALLOY_PASSWORD" not in env
+        assert data["alloy_password"] == "s3cret"
 
     def test_statsd_addresses_match_the_node_loopback(self, tmp_path):
         """Sidecar shares the node netns, so listen and [insight] address are identical."""
@@ -1316,7 +1320,7 @@ class TestAlloySidecar:
             open(os.path.join(builder.ansible_dir, "host_vars", "10.0.0.1.yml"))
         )["alloy_env_variables"]
         assert env["ALLOY_STATSD_LISTEN"] == "127.0.0.1:19125"
-        assert env["ALLOY_RIPPLED_STATSD_ADDRESS"] == "127.0.0.1:19125"
+        assert env["ALLOY_XRPLD_STATSD_ADDRESS"] == "127.0.0.1:19125"
 
     def test_run_sh_runs_alloy_after_main(self, tmp_path):
         builder = self._builder(tmp_path, self._alloy(tmp_path))
@@ -1357,11 +1361,11 @@ class TestAlloySidecar:
         builder.write()
         import yaml
 
-        env = yaml.safe_load(
+        data = yaml.safe_load(
             open(os.path.join(builder.ansible_dir, "host_vars", "10.0.0.1.yml"))
-        )["alloy_env_variables"]
-        assert env["ALLOY_USERNAME"] == "alphanet-1"
-        assert env["ALLOY_PASSWORD"] == "code-1"
+        )
+        assert data["alloy_env_variables"]["ALLOY_USERNAME"] == "alphanet-1"
+        assert data["alloy_password"] == "code-1"
 
     def test_unlisted_node_uses_the_cluster_pair(self, tmp_path):
         alloy = self._alloy(
