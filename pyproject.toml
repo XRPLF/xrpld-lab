@@ -1,6 +1,6 @@
 [project]
 name = "xrpld-lab"
-version = "3.5.0"
+version = "4.0.0"
 description = "Build xrpld networks and standalone ledgers"
 authors = [{ name = "Denis Angell", email = "dangell@transia.co" }]
 readme = "README.md"
