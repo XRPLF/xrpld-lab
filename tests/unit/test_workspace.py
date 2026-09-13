@@ -70,7 +70,8 @@ class TestLogDir:
 
 
 class TestPackageDir:
-    def test_package_dir_exists(self):
+    def test_package_dir_exists(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
         ws = Workspace()
         pkg_dir = ws.package_dir
         # Should point to the xrpld_lab package directory

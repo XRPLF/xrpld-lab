@@ -77,8 +77,8 @@ class TestBuildParser:
         assert args.command == "create:network"
         assert args.log_level == "trace"
         assert args.protocol == "xrpl"
-        assert args.num_validators == 3
-        assert args.num_peers == 1
+        assert args.num_validators is None
+        assert args.num_peers is None
         assert args.network_id is None
         assert args.build_server is None
         assert args.build_version is None
@@ -269,7 +269,7 @@ class TestBuildParser:
         assert args.vips == ["10.0.0.1"]
         assert args.pips == ["10.0.0.2"]
         assert args.protocol == "xrpl"
-        assert args.num_validators == 3
+        assert args.num_validators is None
 
     def test_create_ansible_with_ssh_args(self):
         parser = _build_parser()
@@ -483,6 +483,37 @@ class TestBuildLabConfigNetwork:
         args = self._parse("--num_peers", "3")
         cfg = build_lab_config(args)
         assert cfg.num_peers == 3
+
+    def test_counts_default_to_3_and_1(self):
+        cfg = build_lab_config(self._parse())
+        assert cfg.num_validators == 3
+        assert cfg.num_peers == 1
+
+    def test_ansible_flag_derives_counts_from_ip_lists(self):
+        args = self._parse(
+            "--ansible", "--vips", "10.0.0.1", "10.0.0.2", "--pips", "10.0.0.3"
+        )
+        cfg = build_lab_config(args)
+        assert cfg.num_validators == 2
+        assert cfg.num_peers == 1
+
+    def test_ansible_flag_count_mismatch_exits(self):
+        args = self._parse(
+            "--ansible",
+            "--vips",
+            "10.0.0.1",
+            "10.0.0.2",
+            "10.0.0.3",
+            "--pips",
+            "10.0.0.4",
+            "--num_validators",
+            "4",
+        )
+        with pytest.raises(SystemExit) as exc:
+            build_lab_config(args)
+        assert str(exc.value) == (
+            "error: --num_validators 4 does not match 3 --vips addresses"
+        )
 
     def test_genesis_flag(self):
         args = self._parse("--genesis", "True")
@@ -734,6 +765,51 @@ class TestBuildLabConfigAnsible:
         args = self._parse()
         cfg = build_lab_config(args)
         assert cfg.mode == DeployMode.NETWORK
+
+    def test_counts_come_from_the_ip_lists(self):
+        cfg = build_lab_config(self._parse())
+        assert cfg.num_validators == 2
+        assert cfg.num_peers == 1
+
+    def test_matching_counts_are_accepted(self):
+        cfg = build_lab_config(self._parse("--num_validators", "2", "--num_peers", "1"))
+        assert cfg.num_validators == 2
+        assert cfg.num_peers == 1
+
+    def test_validator_count_mismatch_exits(self):
+        with pytest.raises(SystemExit) as exc:
+            build_lab_config(self._parse("--num_validators", "4"))
+        assert str(exc.value) == (
+            "error: --num_validators 4 does not match 2 --vips addresses"
+        )
+
+    def test_peer_count_mismatch_exits(self):
+        with pytest.raises(SystemExit) as exc:
+            build_lab_config(self._parse("--num_peers", "2"))
+        assert (
+            str(exc.value) == "error: --num_peers 2 does not match 1 --pips addresses"
+        )
+
+    def test_config_file_lists_drive_the_counts(self, tmp_path):
+        config_file = tmp_path / "ansible.yml"
+        config_file.write_text(
+            "vips:\n  - 10.0.0.1\n  - 10.0.0.2\n  - 10.0.0.3\n"
+            "pips:\n  - 10.0.0.4\n  - 10.0.0.5\n"
+        )
+        cfg = build_lab_config(self._parse("--ansible_config", str(config_file)))
+        assert cfg.num_validators == 3
+        assert cfg.num_peers == 2
+
+    def test_config_file_list_mismatch_exits(self, tmp_path):
+        config_file = tmp_path / "ansible.yml"
+        config_file.write_text("vips:\n  - 10.0.0.1\n" "pips:\n  - 10.0.0.2\n")
+        with pytest.raises(SystemExit) as exc:
+            build_lab_config(
+                self._parse("--ansible_config", str(config_file), "--num_peers", "3")
+            )
+        assert (
+            str(exc.value) == "error: --num_peers 3 does not match 1 --pips addresses"
+        )
 
     def test_xrpl_defaults_applied(self):
         args = self._parse("--protocol", "xrpl")

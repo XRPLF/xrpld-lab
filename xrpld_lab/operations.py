@@ -51,11 +51,20 @@ def run_stop_script(workspace: Workspace, name: str) -> bool:
 
 
 def remove_network(workspace: Workspace, name: str) -> bool:
-    """Remove a network directory from the workspace; True when it is gone."""
+    """Stop a network with ``stop.sh --remove`` and delete its directory.
+
+    The directory is removed only after the stop script exits 0, so a running
+    cluster is never left without its compose file. A directory with no
+    ``stop.sh`` (nothing was ever generated) is removed directly.
+    """
     path = os.path.join(workspace.base, name)
     if not os.path.isdir(path):
         print(f"{bcolors.RED}Directory not found: {path}{bcolors.END}")
         return False
+    if os.path.isfile(os.path.join(path, "stop.sh")):
+        if run_command(path, "bash stop.sh --remove") != 0:
+            print(f"{bcolors.RED}stop.sh --remove failed; {path} kept{bcolors.END}")
+            return False
     return remove_directory(path)
 
 
@@ -144,10 +153,12 @@ def start_local(
 
     # 2. Resolve features from source tree (CWD is build/, repo root is ../)
     feature_lines: list = []
+    features_path = ""
     for fpath in spec.feature_paths:
         candidate = os.path.join(cwd, "..", fpath)
         if os.path.exists(candidate):
             feature_lines = get_feature_lines_from_path(candidate)
+            features_path = candidate
             print(f"{bcolors.CYAN}Resolved features from {candidate}{bcolors.END}")
             break
 
@@ -155,13 +166,23 @@ def start_local(
         print(f"{bcolors.RED}Could not resolve features from source tree{bcolors.END}")
         return False
 
-    # 3. Create directories
+    # 3. Parse amendments and build the genesis before anything is written
+    features = parse_amendments(feature_lines)
+    if not features:
+        print(
+            f"{bcolors.RED}No Supported::yes amendment in {features_path}; "
+            f"nothing written{bcolors.END}"
+        )
+        return False
+    genesis = update_genesis(features, protocol)
+
+    # 4. Create directories
     config_dir = os.path.join(cwd, "config")
     os.makedirs(config_dir, exist_ok=True)
     os.makedirs(os.path.join(cwd, "db"), exist_ok=True)
     os.makedirs(os.path.join(cwd, "log"), exist_ok=True)
 
-    # 4. Build NodeConfig for local standalone
+    # 5. Build NodeConfig for local standalone
     node = NodeFactory.create_local_standalone(
         protocol=protocol_enum,
         name="local",
@@ -171,30 +192,39 @@ def start_local(
         vl_keys=[public_key] if public_key else [],
     )
 
-    # 5. Generate config files
+    # 6. Generate config files
     cfg_content = XrpldCfgBuilder(node).build()
     vl_content = ValidatorsTxtBuilder(node, genesis=True).build()
     save_config(protocol, config_dir, cfg_content, vl_content)
-
-    # 6. Parse amendments and generate genesis
-    features = parse_amendments(feature_lines)
-    genesis = update_genesis(features, protocol)
     write_file(
         os.path.join(config_dir, "genesis.json"),
         json.dumps(genesis, indent=4, sort_keys=True),
     )
 
-    # 7. Generate start.sh and stop.sh
+    # 7. Generate start.sh and stop.sh. start.sh execs the daemon in the shell's
+    # own process, so the shell's pid written to xrpld.pid is the daemon's pid
+    # and stop.sh kills only this node.
     flag = "-a" if network_type == "standalone" else ""
     start_content = (
         "#!/bin/bash\n"
+        "echo $$ > xrpld.pid\n"
         f"exec ./{binary_name} {flag} --conf config/{config_filename}"
         " --ledgerfile config/genesis.json\n"
     )
     stop_content = (
         "#!/bin/bash\n"
-        f"pkill -f './{binary_name}' && echo \"{binary_name} stopped\""
-        f' || echo "No running {binary_name} found"\n'
+        "if [ ! -f xrpld.pid ]; then\n"
+        f'  echo "xrpld.pid not found in $(pwd): no {binary_name} started'
+        ' by start.sh here"\n'
+        "  exit 1\n"
+        "fi\n"
+        "PID=$(cat xrpld.pid)\n"
+        'if kill "$PID" 2>/dev/null; then\n'
+        f'  echo "{binary_name} (PID $PID) stopped"\n'
+        "else\n"
+        f'  echo "No running {binary_name} with PID $PID (stale xrpld.pid)"\n'
+        "fi\n"
+        "rm -f xrpld.pid\n"
     )
     write_executable(os.path.join(cwd, "start.sh"), start_content)
     write_executable(os.path.join(cwd, "stop.sh"), stop_content)

@@ -80,8 +80,18 @@ def _add_network_args(p: argparse.ArgumentParser) -> None:
         "--log_level", default="trace", choices=["warning", "debug", "trace"]
     )
     p.add_argument("--protocol", default="xrpl")
-    p.add_argument("--num_validators", type=int, default=3)
-    p.add_argument("--num_peers", type=int, default=1)
+    p.add_argument(
+        "--num_validators",
+        type=int,
+        default=None,
+        help="Validator count (default: 3, or the number of --vips)",
+    )
+    p.add_argument(
+        "--num_peers",
+        type=int,
+        default=None,
+        help="Peer count (default: 1, or the number of --pips)",
+    )
     p.add_argument(
         "--network_id",
         type=int,
@@ -718,6 +728,29 @@ def _build_standalone_config(args, protocol, spec):
     )
 
 
+def _node_count(
+    flag: str,
+    count: Optional[int],
+    default: int,
+    ip_flag: str,
+    ips: Optional[List[str]],
+) -> int:
+    """Node count from *flag*, else from the ansible IP list, else *default*.
+
+    With an ansible config in play (*ips* is a list) an explicit count must
+    equal the list length: every node needs a host and every host a node.
+    """
+    if ips is None:
+        return default if count is None else count
+    if count is None:
+        return len(ips) if ips else default
+    if count != len(ips):
+        raise SystemExit(
+            f"error: {flag} {count} does not match {len(ips)} {ip_flag} addresses"
+        )
+    return count
+
+
 def _build_network_config(args, protocol, spec):
     """Build LabConfig for create:network and create:ansible commands."""
     is_ansible = args.command == "create:ansible"
@@ -800,14 +833,16 @@ def _build_network_config(args, protocol, spec):
     if ansible:
         ansible, log_level = _resolve_service_dependencies(ansible, log_level)
 
-    # For ansible, derive counts from the YAML if not explicitly overridden
-    num_validators = args.num_validators
-    num_peers = args.num_peers
-    if is_ansible and ansible:
-        if ansible.vips and num_validators == 3:
-            num_validators = len(ansible.vips)
-        if ansible.pips and num_peers == 1:
-            num_peers = len(ansible.pips)
+    num_validators = _node_count(
+        "--num_validators",
+        args.num_validators,
+        3,
+        "--vips",
+        ansible.vips if ansible else None,
+    )
+    num_peers = _node_count(
+        "--num_peers", args.num_peers, 1, "--pips", ansible.pips if ansible else None
+    )
 
     key_algorithm = "dilithium" if getattr(args, "quantum", False) else "ed25519"
 

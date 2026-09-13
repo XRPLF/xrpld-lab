@@ -75,6 +75,9 @@ class AnsibleBuilder:
         config_path: str,
         role: str = "validator",
     ) -> AnsibleBuilder:
+        """Register a node host; every node needs an address to be deployed to."""
+        if not ip:
+            raise ValueError(f"{name} has no IP address")
         self._nodes.append(AnsibleNode(name, ip, ports, config_path, role))
         return self
 
