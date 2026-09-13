@@ -161,18 +161,19 @@ class TestHostsTxt:
         assert "10.0.0.2" in content
         assert "10.0.0.10" in content
 
-    def test_has_all_group(self, tmp_path):
+    def test_has_nodes_group(self, tmp_path):
         builder = _build_basic(tmp_path)
         builder.write()
         content = open(os.path.join(builder.ansible_dir, "hosts.txt")).read()
-        assert "[all]" in content
+        assert "[nodes]" in content
+        assert "[all]" not in content
 
     def test_no_role_based_groups(self, tmp_path):
         builder = _build_basic(tmp_path)
         builder.write()
         content = open(os.path.join(builder.ansible_dir, "hosts.txt")).read()
         assert "[validator]" not in content
-        assert content.count("[all]") == 1
+        assert content.count("[nodes]") == 1
 
     def test_ssh_settings(self, tmp_path):
         builder = _build_basic(tmp_path)
@@ -261,6 +262,136 @@ class TestHostsTxt:
         content = open(os.path.join(builder.ansible_dir, "hosts.txt")).read()
         assert "[proxy]" in content
         assert "[infra]" in content
+
+
+# ===========================================================================
+# nodes group: node plays reach validators and peers only
+# ===========================================================================
+
+
+def _inventory_groups(content: str) -> dict:
+    """Map each [group] in an ini inventory to the hosts listed under it."""
+    groups: dict = {}
+    current = None
+    for line in content.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            current = line[1:-1]
+            groups[current] = []
+            continue
+        groups[current].append(line.split()[0])
+    return groups
+
+
+class TestNodesGroup:
+    NODE_TEMPLATES = [
+        "_DEPS_YML",
+        "_MAIN_HEADER",
+        "_MAIN_HEADER_ROLLING",
+        "_CLEAN_YML",
+        "_ALLOY_YML",
+        "_STATUS_YML",
+    ]
+
+    def _builder(self, tmp_path, services):
+        cluster_dir = str(tmp_path / "nodes-cluster")
+        os.makedirs(cluster_dir, exist_ok=True)
+        config = AnsibleConfig(
+            vips=["10.0.0.1", "10.0.0.2"], pips=["10.0.0.10"], services=services
+        )
+        builder = AnsibleBuilder(cluster_dir, config, "transia/cluster:abc")
+        for i, ip in enumerate(config.vips, 1):
+            builder.add_node(
+                f"vnode{i}",
+                ip,
+                _validator_ports(i),
+                f"{cluster_dir}/vnode{i}/config/",
+                "validator",
+            )
+        builder.add_node(
+            "pnode1",
+            "10.0.0.10",
+            _peer_ports(1),
+            f"{cluster_dir}/pnode1/config/",
+            "peer",
+        )
+        builder.write()
+        return builder
+
+    def _groups(self, builder) -> dict:
+        return _inventory_groups(
+            open(os.path.join(builder.ansible_dir, "hosts.txt")).read()
+        )
+
+    def test_nodes_group_holds_exactly_the_validators_and_peers(self, tmp_path):
+        groups = self._groups(self._builder(tmp_path, []))
+        assert list(groups) == ["nodes"]
+        assert groups["nodes"] == ["10.0.0.1", "10.0.0.2", "10.0.0.10"]
+
+    @pytest.mark.parametrize("name", NODE_TEMPLATES)
+    def test_node_template_targets_nodes(self, name):
+        plays = yaml.safe_load(getattr(ansible_builder, name) + "  tasks: []\n")
+        assert plays[0]["hosts"] == "nodes"
+
+    def test_generated_node_playbooks_target_nodes(self, tmp_path):
+        builder = self._builder(tmp_path, [])
+        for playbook in ("deps.yml", "main.yml", "clean.yml"):
+            plays = yaml.safe_load(
+                open(os.path.join(builder.ansible_dir, playbook)).read()
+            )
+            assert [p["hosts"] for p in plays] == ["nodes"], playbook
+
+    def test_dedicated_services_host_is_outside_nodes(self, tmp_path):
+        builder = self._builder(
+            tmp_path,
+            [
+                _services_host(
+                    "infra",
+                    "10.0.0.50",
+                    nginx=NginxConfig(domain="test.example.com"),
+                    redis=RedisConfig(),
+                )
+            ],
+        )
+        groups = self._groups(builder)
+        assert groups["nodes"] == ["10.0.0.1", "10.0.0.2", "10.0.0.10"]
+        assert groups["infra"] == ["10.0.0.50"]
+        assert not os.path.exists(
+            os.path.join(builder.ansible_dir, "host_vars", "10.0.0.50.yml")
+        )
+        for playbook in ("nginx/main.yml", "redis/main.yml"):
+            plays = yaml.safe_load(
+                open(
+                    os.path.join(builder.ansible_dir, "services", "infra", playbook)
+                ).read()
+            )
+            assert [p["hosts"] for p in plays] == ["infra"], playbook
+
+    def test_services_host_that_is_a_node_is_in_both_groups(self, tmp_path):
+        builder = self._builder(
+            tmp_path,
+            [
+                _services_host(
+                    "proxy",
+                    "10.0.0.10",
+                    nginx=NginxConfig(domain="test.example.com"),
+                    status=StatusConfig(),
+                )
+            ],
+        )
+        groups = self._groups(builder)
+        assert groups["nodes"] == ["10.0.0.1", "10.0.0.2", "10.0.0.10"]
+        assert groups["proxy"] == ["10.0.0.10"]
+        status_site = yaml.safe_load(
+            open(
+                os.path.join(
+                    builder.ansible_dir, "services", "proxy", "status", "main.yml"
+                )
+            ).read()
+        )
+        assert status_site[0]["hosts"] == "proxy"
 
 
 # ===========================================================================
@@ -1144,7 +1275,7 @@ class TestMainYmlGenesisModes:
 
     def test_genesis_main_yml_is_valid_yaml(self, tmp_path):
         plays = yaml.safe_load(self._main_yml(tmp_path, genesis=True))
-        assert plays[0]["hosts"] == "all"
+        assert plays[0]["hosts"] == "nodes"
         names = [t["name"] for t in plays[0]["tasks"]]
         assert "Deploy Docker Image" in names
 
@@ -1608,7 +1739,7 @@ class TestStatusService:
         builder.write()
         content = open(os.path.join(builder.ansible_dir, "status.yml")).read()
         plays = yaml.safe_load(content)
-        assert plays[0]["hosts"] == "all"
+        assert plays[0]["hosts"] == "nodes"
         names = [t.get("name") for t in plays[0]["tasks"]]
         assert "Install the sampler" in names
         assert "Write the sampler environment" in names
