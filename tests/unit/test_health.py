@@ -10,7 +10,9 @@ import json
 import urllib.error
 from unittest.mock import patch
 
+from xrpld_lab import health
 from xrpld_lab.health import _server_state, check_consensus
+from xrpld_lab.services.status import node_metrics
 
 
 class FakeClock:
@@ -66,6 +68,11 @@ def _run(nodes: FakeNodes, vips, timeout_s=60, interval_s=10):
 
 
 class TestCheckConsensus:
+    def test_healthy_rule_is_the_status_samplers(self):
+        # One definition: health and /api/network/health agree on what healthy is.
+        assert health.HEALTHY_STATE is node_metrics.HEALTHY_STATE
+        assert health.HEALTHY_STATE["validator"] == "proposing"
+
     def test_polls_each_validator_on_its_own_public_rpc_port(self):
         # vnode i listens on 5007 + i * 100 (PortSet.for_node VALIDATOR offset).
         nodes = FakeNodes({V1: [("proposing", 5)], V2: [("proposing", 5)]})
@@ -119,6 +126,25 @@ class TestCheckConsensus:
         assert ok is False
         out = capsys.readouterr().out
         assert "seq=6 (advanced) \x1b[35mconnected" in out
+
+    def test_a_full_validator_with_an_advancing_ledger_is_not_ok(self, capsys):
+        # full means the validator only follows the ledger; it is not proposing.
+        nodes = FakeNodes(
+            {
+                V1: [("full", 5), ("full", 6), ("full", 7)],
+                V2: [("proposing", 5), ("proposing", 6), ("proposing", 7)],
+            }
+        )
+
+        ok, clock = _run(nodes, ["10.0.0.1", "10.0.0.2"], timeout_s=25)
+
+        assert ok is False
+        assert clock.sleeps == [10, 10, 10]
+        out = capsys.readouterr().out
+        assert "vnode1 state=full seq=6 (advanced) \x1b[35mfull" in out
+        assert "vnode2 state=proposing seq=6 (advanced) \x1b[32mOK" in out
+        assert "1/2 healthy — retrying in 10s" in out
+        assert "[health] timed out after 25s waiting for consensus." in out
 
     def test_unreachable_validator_is_skipped_until_it_answers(self, capsys):
         nodes = FakeNodes(

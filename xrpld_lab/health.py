@@ -1,9 +1,12 @@
 """Network health check — poll validators until they reach consensus.
 
 After ansible starts the nodes, we confirm the network actually converged:
-each validator's public RPC ``server_info`` must report a healthy
-``server_state`` (proposing / full / validating) and an advancing validated
-ledger. Uses the stdlib only (urllib) so it carries no new deps.
+each validator's public RPC ``server_info`` must report ``server_state``
+``proposing`` and an advancing validated ledger. A validator in ``full`` only
+follows the ledger (outside the UNL, or with the wrong validation key), so
+``full`` is not enough. The rule is the status sampler's ``HEALTHY_STATE`` so
+``health`` and ``/api/network/health`` agree. Uses the stdlib only (urllib) so
+it carries no new deps.
 """
 
 from __future__ import annotations
@@ -15,10 +18,8 @@ import urllib.request
 from typing import Callable, List
 
 from xrpld_lab.models import NodeRole, PortSet
+from xrpld_lab.services.status.node_metrics import HEALTHY_STATE
 from xrpld_lab.utils import bcolors
-
-# A validator that has joined consensus is in one of these states.
-_HEALTHY_STATES = {"proposing", "full", "validating"}
 
 
 def _server_state(url: str, timeout: float) -> tuple[str | None, int]:
@@ -43,7 +44,7 @@ def check_consensus(
     clock: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
 ) -> bool:
-    """Poll every validator until all are healthy AND a ledger has advanced.
+    """Poll every validator until all are proposing AND a ledger has advanced.
 
     Args:
         vips: validator external IPs, in node order (node i → PortSet i).
@@ -78,7 +79,7 @@ def check_consensus(
 
             first_seq.setdefault(node_id, seq)
             advanced = seq > first_seq[node_id]
-            ok = state in _HEALTHY_STATES and advanced
+            ok = state == HEALTHY_STATE["validator"] and advanced
             mark = (bcolors.GREEN + "OK") if ok else (bcolors.PURPLE + str(state))
             print(
                 f"  vnode{node_id} state={state} seq={seq} "
