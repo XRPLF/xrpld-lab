@@ -7,7 +7,9 @@ and passes the config to LabRunner.run().
 from __future__ import annotations
 
 import argparse
+import os
 import re
+import subprocess
 from typing import List, Optional
 
 from xrpld_lab.config import load_ansible_config, load_overrides_file
@@ -72,6 +74,39 @@ def _parse_bool(value: str) -> bool:
     if lowered in ("0", "false", "no", "n"):
         return False
     raise argparse.ArgumentTypeError(f"expected a boolean, got {value!r}")
+
+
+def _add_workspace_arg(p: argparse.ArgumentParser) -> None:
+    """Add --workspace: the root that holds every cluster directory and keystore."""
+    p.add_argument(
+        "--workspace",
+        default=None,
+        help="Workspace root holding each <cluster>-cluster directory and its "
+        "keystore (default: ./workspace). Point at an existing network's "
+        "workspace to address it, or to reuse its identity instead of "
+        "copying keys.",
+    )
+
+
+def _add_cluster_args(p: argparse.ArgumentParser, required: bool = True) -> None:
+    """Add --name and --workspace, which together locate a cluster directory."""
+    p.add_argument(
+        "--name",
+        required=required,
+        default=None,
+        help="Cluster name, as <name> or <name>-cluster",
+    )
+    _add_workspace_arg(p)
+
+
+def _add_port_offset_arg(p: argparse.ArgumentParser) -> None:
+    """Add --port_offset for commands that reach a node of an existing cluster."""
+    p.add_argument(
+        "--port_offset",
+        type=int,
+        default=0,
+        help="The --port_offset the cluster was created with (default: 0).",
+    )
 
 
 def _add_network_args(p: argparse.ArgumentParser) -> None:
@@ -220,13 +255,7 @@ def _add_network_args(p: argparse.ArgumentParser) -> None:
         default="USD",
         help="Currency code for preloaded trustlines",
     )
-    p.add_argument(
-        "--workspace",
-        default=None,
-        help="Workspace root holding <cluster>-cluster and its keystore "
-        "(default: ./workspace). Point at an existing network's "
-        "workspace to reuse its identity instead of copying keys.",
-    )
+    _add_workspace_arg(p)
     p.add_argument(
         "--vl_site",
         default=None,
@@ -340,7 +369,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--pips", nargs="+", default=None, help="Peer IP addresses (for ansible)"
     )
     p.add_argument(
-        "--ssh_port", type=int, default=20, help="SSH port for ansible (default: 20)"
+        "--ssh_port", type=int, default=22, help="SSH port for ansible (default: 22)"
     )
     p.add_argument(
         "--ssh_user", default="ubuntu", help="SSH user for ansible (default: ubuntu)"
@@ -357,7 +386,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--binary_name", default="xrpld")
     p.add_argument("--vips", nargs="+", default=None, help="Validator IP addresses")
     p.add_argument("--pips", nargs="+", default=None, help="Peer IP addresses")
-    p.add_argument("--ssh_port", type=int, default=20)
+    p.add_argument("--ssh_port", type=int, default=22)
     p.add_argument("--ssh_user", default="ubuntu")
     p.add_argument("--ssh_key", default="~/.ssh/id_rsa")
     p.add_argument(
@@ -382,12 +411,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p = subparsers.add_parser(
         "deploy:ansible", help="Run ansible deployment for an existing cluster"
     )
-    p.add_argument("--name", required=True, help="Cluster name")
-    p.add_argument(
-        "--workspace",
-        default=None,
-        help="Workspace root holding <name>-cluster (default: ./workspace)",
-    )
+    _add_cluster_args(p)
 
     # -- health --------------------------------------------------------------
     p = subparsers.add_parser(
@@ -400,16 +424,17 @@ def _build_parser() -> argparse.ArgumentParser:
         "--timeout", type=int, default=300, help="Overall deadline (seconds)"
     )
     p.add_argument("--interval", type=int, default=10, help="Seconds between polls")
+    _add_port_offset_arg(p)
 
     # -- Operational commands ------------------------------------------------
     p = subparsers.add_parser("up", help="Start network")
-    p.add_argument("--name", required=True)
+    _add_cluster_args(p)
 
     p = subparsers.add_parser("down", help="Stop network")
-    p.add_argument("--name", required=True)
+    _add_cluster_args(p)
 
     p = subparsers.add_parser("remove", help="Remove network")
-    p.add_argument("--name", required=True)
+    _add_cluster_args(p)
 
     # -- down:standalone -----------------------------------------------------
     p = subparsers.add_parser(
@@ -441,7 +466,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # -- update:node ---------------------------------------------------------
     p = subparsers.add_parser("update:node", help="Update a node binary")
-    p.add_argument("--name", required=True)
+    _add_cluster_args(p)
     p.add_argument("--node_id", type=int, required=True)
     p.add_argument("--node_type", required=True, choices=["validator", "peer"])
     p.add_argument(
@@ -461,12 +486,6 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="docker image to extract the xrpld binary from (local or GAR)",
     )
-    p.add_argument(
-        "--workspace",
-        default=None,
-        help="workspace root holding the cluster dir; defaults to ./workspace "
-        "(set this when invoking from outside the lab root)",
-    )
 
     # -- vote:amendment ----------------------------------------------------
     p = subparsers.add_parser(
@@ -474,15 +493,16 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Lift the veto on an amendment so the validators vote for it; "
         "activation follows the flag-ledger supermajority",
     )
-    p.add_argument("--name", required=True, help="Cluster directory name")
+    _add_cluster_args(p)
     p.add_argument("--amendment_name", required=True)
     p.add_argument(
         "--node_id", type=int, default=None, help="One validator instead of all"
     )
+    _add_port_offset_arg(p)
 
     # -- node:stall ----------------------------------------------------------
     p = subparsers.add_parser("node:stall", help="Stall a node (pause consensus)")
-    p.add_argument("--name", required=True)
+    _add_cluster_args(p)
     p.add_argument("--node_id", type=int, required=True)
     p.add_argument("--node_type", required=True, choices=["validator", "peer"])
     p.add_argument(
@@ -492,12 +512,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Stall duration in ms (default: 30000)",
     )
     p.add_argument("--clear", action="store_true", help="Clear the stall immediately")
+    _add_port_offset_arg(p)
 
     # -- node:restart --------------------------------------------------------
     p = subparsers.add_parser(
         "node:restart",
         help="Restart a single local node (syncs from network)",
     )
+    _add_cluster_args(p)
     p.add_argument("node_name", help="Node directory name (e.g. vnode2)")
     p.add_argument(
         "--genesis",
@@ -507,7 +529,13 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # -- logs:local ----------------------------------------------------------
     p = subparsers.add_parser("logs:local", help="View local node logs")
-    p.add_argument("--node", default=None)
+    _add_cluster_args(p, required=False)
+    p.add_argument(
+        "--node",
+        default=None,
+        help="Node directory name (e.g. vnode1); omit to search every node. "
+        "Without --name the current directory is searched.",
+    )
 
     # -- logs:standalone -----------------------------------------------------
     p = subparsers.add_parser("logs:standalone", help="View standalone Docker logs")
@@ -919,7 +947,7 @@ def main() -> None:
         lab = build_lab_config(args)
         generated = LabRunner(lab, workspace).run()
         if args.command == "up:standalone" and not run_start_script(
-            workspace, generated
+            os.path.join(workspace.base, generated)
         ):
             raise SystemExit(1)
         return
@@ -930,16 +958,19 @@ def main() -> None:
         from xrpld_lab.health import check_consensus
 
         ok = check_consensus(
-            args.vips, timeout_s=args.timeout, interval_s=args.interval
+            args.vips,
+            timeout_s=args.timeout,
+            interval_s=args.interval,
+            port_offset=args.port_offset,
         )
     elif args.command == "deploy:ansible":
-        ok = _deploy_ansible(workspace, args.name)
+        ok = _deploy_ansible(workspace.resolve_cluster(args.name))
     elif args.command == "up":
-        ok = run_start_script(workspace, args.name)
+        ok = run_start_script(workspace.resolve_cluster(args.name))
     elif args.command == "down":
-        ok = run_stop_script(workspace, args.name)
+        ok = run_stop_script(workspace.resolve_cluster(args.name))
     elif args.command == "remove":
-        ok = remove_network(workspace, args.name)
+        ok = remove_network(workspace.resolve_cluster(args.name))
     elif args.command == "down:standalone":
         ok = stop_standalone(workspace, args.name, args.protocol, args.version)
     elif args.command == "up:local":
@@ -955,8 +986,7 @@ def main() -> None:
         ok = stop_local()
     elif args.command == "update:node":
         ok = update_node_binary(
-            workspace,
-            args.name,
+            workspace.resolve_cluster(args.name),
             args.node_id,
             args.node_type,
             args.build_server,
@@ -965,33 +995,35 @@ def main() -> None:
         )
     elif args.command == "vote:amendment":
         ok = vote_amendment(
-            args.name, args.amendment_name, workspace, node_id=args.node_id
+            workspace.resolve_cluster(args.name),
+            args.amendment_name,
+            node_id=args.node_id,
+            port_offset=args.port_offset,
         )
     elif args.command == "node:stall":
         ok = node_stall(
-            args.name,
+            workspace.resolve_cluster(args.name),
             args.node_id,
             args.node_type,
-            workspace,
             args.duration_ms,
             args.clear,
+            port_offset=args.port_offset,
         )
     elif args.command == "node:restart":
-        ok = restart_local_node(args.node_name, genesis=args.genesis)
+        ok = restart_local_node(
+            workspace.resolve_cluster(args.name), args.node_name, genesis=args.genesis
+        )
     elif args.command == "logs:local":
-        view_local_logs(args.node)
+        net_dir = workspace.resolve_cluster(args.name) if args.name else os.getcwd()
+        view_local_logs(net_dir, args.node)
     elif args.command == "logs:standalone":
         view_standalone_logs(args.protocol)
     if not ok:
         raise SystemExit(1)
 
 
-def _deploy_ansible(workspace: Workspace, name: str) -> bool:
+def _deploy_ansible(cluster_dir: str) -> bool:
     """Run the ansible deployment for an existing cluster; True when run.sh exits 0."""
-    import os
-    import subprocess
-
-    cluster_dir = workspace.cluster_path(name)
     ansible_dir = os.path.join(cluster_dir, "ansible")
     run_sh = os.path.join(ansible_dir, "run.sh")
 

@@ -32,6 +32,42 @@ class TestClusterDir:
         assert path1 == path2
 
 
+class TestResolveCluster:
+    """resolve_cluster accepts X or X-cluster and never creates anything."""
+
+    def test_short_name_gets_the_suffix(self, tmp_path):
+        ws = Workspace(base=str(tmp_path))
+        assert ws.resolve_cluster("3.3.0") == os.path.join(
+            str(tmp_path), "3.3.0-cluster"
+        )
+        assert not os.path.exists(os.path.join(str(tmp_path), "3.3.0-cluster"))
+
+    def test_full_name_is_not_suffixed_again(self, tmp_path):
+        ws = Workspace(base=str(tmp_path))
+        assert ws.resolve_cluster("3.3.0-cluster") == os.path.join(
+            str(tmp_path), "3.3.0-cluster"
+        )
+
+    def test_both_forms_resolve_to_the_same_existing_directory(self, tmp_path):
+        ws = Workspace(base=str(tmp_path))
+        path = ws.cluster_dir("3.3.0")
+        assert ws.resolve_cluster("3.3.0") == path
+        assert ws.resolve_cluster("3.3.0-cluster") == path
+
+    def test_existing_directory_named_as_given_wins(self, tmp_path):
+        ws = Workspace(base=str(tmp_path))
+        os.makedirs(os.path.join(str(tmp_path), "xrpl-3.3.0"))
+        assert ws.resolve_cluster("xrpl-3.3.0") == os.path.join(
+            str(tmp_path), "xrpl-3.3.0"
+        )
+
+    def test_existing_cluster_directory_wins_over_the_name_as_given(self, tmp_path):
+        ws = Workspace(base=str(tmp_path))
+        os.makedirs(os.path.join(str(tmp_path), "net"))
+        cluster = ws.cluster_dir("net")
+        assert ws.resolve_cluster("net") == cluster
+
+
 class TestStandaloneDir:
     def test_standalone_dir(self, tmp_path):
         ws = Workspace(base=str(tmp_path))

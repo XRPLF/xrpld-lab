@@ -412,7 +412,7 @@ class ServicesHost:
 
 @dataclass
 class AnsibleConfig:
-    ssh_port: int = 20
+    ssh_port: int = 22
     ssh_user: str = "ubuntu"
     ssh_key_path: str = "~/.ssh/id_rsa"
     vips: List[str] = field(default_factory=list)

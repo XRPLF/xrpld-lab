@@ -82,6 +82,24 @@ class TestCheckConsensus:
         assert [url for url, _ in nodes.calls[:2]] == [V1, V2]
         assert {t for _, t in nodes.calls} == {5.0}
 
+    def test_port_offset_shifts_every_public_rpc_port(self):
+        # A cluster created with --port_offset 1000 answers on 6107 and 6207.
+        v1, v2 = "http://10.0.0.1:6107", "http://10.0.0.2:6207"
+        nodes = FakeNodes({v1: [("proposing", 5)], v2: [("proposing", 5)]})
+        clock = FakeClock()
+
+        check_consensus(
+            ["10.0.0.1", "10.0.0.2"],
+            timeout_s=10,
+            interval_s=10,
+            port_offset=1000,
+            fetch=nodes,
+            clock=clock,
+            sleep=clock.sleep,
+        )
+
+        assert [url for url, _ in nodes.calls[:2]] == [v1, v2]
+
     def test_all_healthy_in_the_same_round_returns_true(self, capsys):
         nodes = FakeNodes(
             {
