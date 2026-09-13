@@ -14,6 +14,7 @@ Covers:
 - view_local_logs / view_standalone_logs: log file discovery
 """
 
+import json
 import os
 import subprocess
 from unittest.mock import patch, MagicMock
@@ -38,6 +39,7 @@ from xrpld_lab.operations import (
     view_standalone_logs,
 )
 from xrpld_lab.script_builder import DockerfileBuilder
+from xrpld_lab.utils import sha512_half
 
 
 def _workspace(base: str) -> MagicMock:
@@ -192,6 +194,111 @@ class TestLocalScripts:
         assert start_local() is False
         mock_run.assert_not_called()
         assert "not found in /my/project" in capsys.readouterr().out
+
+    @staticmethod
+    def _build_tree(tmp_path, feature_line: str) -> str:
+        """A fake ``<repo>/build`` with an xrpld binary and the features.macro."""
+        build = tmp_path / "build"
+        build.mkdir()
+        (build / "xrpld").write_text("#!/bin/sh\n")
+        macro = tmp_path / "include" / "xrpl" / "protocol" / "detail"
+        macro.mkdir(parents=True)
+        (macro / "features.macro").write_text(feature_line + "\n")
+        return str(build)
+
+    @patch("xrpld_lab.operations.subprocess.run")
+    def test_start_local_writes_config_and_launches(
+        self, mock_run, tmp_path, monkeypatch, capsys
+    ):
+        build = self._build_tree(
+            tmp_path, "XRPL_FEATURE(DID, Supported::yes, VoteBehavior::DefaultYes)"
+        )
+        monkeypatch.chdir(build)
+        mock_run.return_value.returncode = 0
+
+        assert start_local(protocol="xrpl", network_id=1234) is True
+
+        start = tmp_path / "build" / "start.sh"
+        stop = tmp_path / "build" / "stop.sh"
+        assert start.read_text() == (
+            "#!/bin/bash\n"
+            "exec ./xrpld -a --conf config/xrpld.cfg --ledgerfile config/genesis.json\n"
+        )
+        assert stop.read_text() == (
+            "#!/bin/bash\n"
+            "pkill -f './xrpld' && echo \"xrpld stopped\""
+            ' || echo "No running xrpld found"\n'
+        )
+        assert os.access(start, os.X_OK) and os.access(stop, os.X_OK)
+        assert (tmp_path / "build" / "db").is_dir()
+        assert (tmp_path / "build" / "log").is_dir()
+
+        config = tmp_path / "build" / "config"
+        cfg = (config / "xrpld.cfg").read_text()
+        assert "[network_id]\n1234\n" in cfg
+        assert "[validators]\n" in (config / "validators.txt").read_text()
+        with open(config / "genesis.json") as f:
+            genesis = json.load(f)
+        amendments = [
+            e
+            for e in genesis["ledger"]["accountState"]
+            if e["LedgerEntryType"] == "Amendments"
+        ]
+        assert amendments[0]["Amendments"] == [sha512_half(b"DID".hex())]
+
+        assert mock_run.call_args.args[0] == ["bash", "start.sh"]
+        assert mock_run.call_args.kwargs == {"cwd": build}
+        out = capsys.readouterr().out
+        assert f"Generated config in {config}" in out
+        assert "Starting xrpld (Ctrl+C to stop)..." in out
+
+    @patch("xrpld_lab.operations.subprocess.run")
+    def test_start_local_network_mode_drops_the_standalone_flag(
+        self, mock_run, tmp_path, monkeypatch
+    ):
+        build = self._build_tree(
+            tmp_path, "XRPL_FEATURE(DID, Supported::yes, VoteBehavior::DefaultYes)"
+        )
+        monkeypatch.chdir(build)
+        mock_run.return_value.returncode = 0
+
+        assert start_local(network_type="network", network_id=7) is True
+
+        assert (tmp_path / "build" / "start.sh").read_text() == (
+            "#!/bin/bash\n"
+            "exec ./xrpld  --conf config/xrpld.cfg --ledgerfile config/genesis.json\n"
+        )
+
+    @patch("xrpld_lab.operations.subprocess.run")
+    def test_start_local_without_supported_features_raises(
+        self, mock_run, tmp_path, monkeypatch
+    ):
+        # update_genesis raises when no amendment is Supported::yes; start_local
+        # does not turn that into a False return.
+        build = self._build_tree(
+            tmp_path, "XRPL_FEATURE(DID, Supported::no, VoteBehavior::DefaultNo)"
+        )
+        monkeypatch.chdir(build)
+
+        with pytest.raises(RuntimeError, match="No features found for xrpl"):
+            start_local(network_id=1234)
+
+        mock_run.assert_not_called()
+        assert not (tmp_path / "build" / "start.sh").exists()
+
+    @patch("xrpld_lab.operations.subprocess.run")
+    def test_start_local_without_a_features_file_returns_false(
+        self, mock_run, tmp_path, monkeypatch, capsys
+    ):
+        build = tmp_path / "build"
+        build.mkdir()
+        (build / "xrpld").write_text("")
+        monkeypatch.chdir(build)
+
+        assert start_local() is False
+
+        mock_run.assert_not_called()
+        assert "Could not resolve features" in capsys.readouterr().out
 
     @patch("xrpld_lab.operations.run_command", return_value=0)
     @patch("os.path.isfile", return_value=True)
@@ -721,7 +828,7 @@ class TestNodeStall:
     """node_stall admin RPC dispatch."""
 
     @patch("xrpld_lab.operations.requests.post")
-    def test_stall_sends_duration(self, mock_post):
+    def test_stall_sends_duration(self, mock_post, capsys):
         mock_post.return_value = _rpc_response()
 
         ok = node_stall("my-net", 1, "validator", MagicMock(), duration_ms=5000)
@@ -732,15 +839,21 @@ class TestNodeStall:
             "method": "node_stall",
             "params": [{"duration_ms": 5000}],
         }
+        out = capsys.readouterr().out
+        assert "Stalling (5000ms) validator 1 at http://localhost:5105..." in out
+        assert "node_stall RPC sent." in out
 
     @patch("xrpld_lab.operations.requests.post")
-    def test_clear_sends_clear(self, mock_post):
+    def test_clear_sends_clear(self, mock_post, capsys):
         mock_post.return_value = _rpc_response()
 
-        node_stall("my-net", 2, "peer", MagicMock(), clear=True)
+        assert node_stall("my-net", 2, "peer", MagicMock(), clear=True) is True
 
         assert mock_post.call_args.args[0] == "http://localhost:5025"
         assert mock_post.call_args.kwargs["json"]["params"] == [{"clear": True}]
+        assert "Clearing stall on peer 2 at http://localhost:5025..." in (
+            capsys.readouterr().out
+        )
 
     @patch("xrpld_lab.operations.requests.post")
     def test_rpc_error_result_is_a_failure(self, mock_post, capsys):
@@ -755,6 +868,24 @@ class TestNodeStall:
         assert node_stall("my-net", 1, "validator", MagicMock()) is False
         out = capsys.readouterr().out
         assert "Unknown method." in out
+        assert "node_stall RPC sent" not in out
+
+    @patch("xrpld_lab.operations.requests.post")
+    def test_default_duration_is_30s(self, mock_post):
+        mock_post.return_value = _rpc_response()
+
+        node_stall("my-net", 1, "validator", MagicMock())
+
+        assert mock_post.call_args.kwargs["json"]["params"] == [{"duration_ms": 30000}]
+
+    @patch(
+        "xrpld_lab.operations.requests.post",
+        side_effect=requests.ConnectionError("refused"),
+    )
+    def test_unreachable_node_is_a_failure(self, mock_post, capsys):
+        assert node_stall("my-net", 1, "validator", MagicMock()) is False
+        out = capsys.readouterr().out
+        assert "RPC request failed: refused" in out
         assert "node_stall RPC sent" not in out
 
 

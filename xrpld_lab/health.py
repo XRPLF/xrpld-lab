@@ -12,7 +12,7 @@ import json
 import time
 import urllib.error
 import urllib.request
-from typing import List
+from typing import Callable, List
 
 from xrpld_lab.models import NodeRole, PortSet
 from xrpld_lab.utils import bcolors
@@ -38,6 +38,10 @@ def check_consensus(
     timeout_s: int = 300,
     interval_s: int = 10,
     rpc_timeout_s: float = 5.0,
+    *,
+    fetch: Callable[[str, float], tuple[str | None, int]] = _server_state,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> bool:
     """Poll every validator until all are healthy AND a ledger has advanced.
 
@@ -45,6 +49,9 @@ def check_consensus(
         vips: validator external IPs, in node order (node i → PortSet i).
         timeout_s: overall deadline.
         interval_s: seconds between polling rounds.
+        fetch: ``(url, rpc_timeout_s) -> (server_state, validated_seq)``.
+        clock: monotonic seconds, read for the deadline.
+        sleep: waits between polling rounds.
 
     Returns True once the whole set is healthy; False on timeout.
     """
@@ -52,7 +59,7 @@ def check_consensus(
         (i + 1, f"http://{ip}:{PortSet.for_node(i + 1, NodeRole.VALIDATOR).rpc_public}")
         for i, ip in enumerate(vips)
     ]
-    deadline = time.monotonic() + timeout_s
+    deadline = clock() + timeout_s
     first_seq: dict[int, int] = {}
 
     print(
@@ -60,11 +67,11 @@ def check_consensus(
         f"{len(endpoints)} validators…{bcolors.END}"
     )
 
-    while time.monotonic() < deadline:
+    while clock() < deadline:
         healthy = 0
         for node_id, url in endpoints:
             try:
-                state, seq = _server_state(url, rpc_timeout_s)
+                state, seq = fetch(url, rpc_timeout_s)
             except (urllib.error.URLError, OSError, ValueError) as e:
                 print(f"  vnode{node_id} {url} — unreachable ({e})")
                 continue
@@ -88,7 +95,7 @@ def check_consensus(
             return True
 
         print(f"  {healthy}/{len(endpoints)} healthy — retrying in {interval_s}s")
-        time.sleep(interval_s)
+        sleep(interval_s)
 
     print(
         f"{bcolors.RED}[health] timed out after {timeout_s}s waiting for "
