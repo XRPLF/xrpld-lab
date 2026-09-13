@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>xrpld network status</title>
+<link rel="icon" href="data:,">
 <style>
   :root {
     color-scheme: light dark;
@@ -81,6 +82,7 @@
   <span class="meta" id="netid"></span>
   <span class="meta" id="genesis"></span>
   <span class="spacer"></span>
+  <span id="ws" class="badge dim">· connecting</span>
   <span class="meta" id="updated"></span>
 </header>
 <main>
@@ -208,12 +210,8 @@ function renderLive(data) {
   const healthy = data.healthy ?? (okV === validators.length && okP === peers.length);
   document.getElementById('health').outerHTML = `<span id="health" class="badge ${healthy ? 'ok' : (okV >= Math.ceil(validators.length * 0.8) ? 'warn' : 'bad')}">` +
     `${healthy ? '● healthy' : (okV >= Math.ceil(validators.length * 0.8) ? '▲ degraded' : '✕ down')}</span>`;
-  document.getElementById('stats').innerHTML = [
-    ['Validated ledger', fmtNum(data.validated_ledger)],
-    ['Validators', `${okV}<small> / ${validators.length}</small>`],
-    ['Peers', `${okP}<small> / ${peers.length}</small>`],
-    ['Agreement', data.agreement == null ? '–' : badge(data.agreement ? 'ok' : 'bad', data.agreement ? 'in sync' : 'diverged')],
-  ].map(([k, v]) => `<div class="stat"><div class="k">${k}</div><div class="v">${v}</div></div>`).join('');
+  sampled = { validated_ledger: data.validated_ledger, okV, validators: validators.length, okP, peers: peers.length, agreement: data.agreement };
+  renderStats();
 
   document.getElementById('nodes').innerHTML = `<tr><th>Node</th><th>Role</th><th>State</th><th>Build</th><th style="text-align:right">Validated</th><th style="text-align:right">Peers</th><th style="text-align:right">Uptime</th></tr>` +
     nodes.map(n => `<tr><td><a href="nodes/${esc(n.name)}/">${esc(n.name)}</a></td><td>${esc(n.role)}</td>` +
@@ -223,8 +221,71 @@ function renderLive(data) {
 
   const live = { build_version: (nodes.find(n => n.build_version) || {}).build_version };
   renderNetwork(data.network || {}, live);
+  connectLedgerStream(data.network?.endpoints?.websocket);
   document.getElementById('name').textContent = `${data.name || 'xrpld network'} status`;
   document.getElementById('updated').textContent = 'updated ' + new Date().toLocaleTimeString();
+}
+
+// Chain figures arrive from the public node's websocket (ledger and server streams) the moment a
+// ledger closes; the sampler poll supplies the per-node counts and the agreement check.
+let sampled = {};
+const chain = { seq: null, txns: null, closedAt: null, fee: null, reserve: null, link: 'connecting' };
+const RIPPLE_EPOCH_MS = 946684800000;
+
+function renderStats() {
+  const s = sampled;
+  document.getElementById('stats').innerHTML = [
+    ['Validated ledger', fmtNum(chain.seq ?? s.validated_ledger)],
+    ['Last close', `<span id="stat-close">${closeAge()}</span>`],
+    ['Txns in ledger', chain.txns == null ? '–' : fmtNum(chain.txns)],
+    ['Base fee', chain.fee == null ? '–' : `${fmtNum(chain.fee)}<small> drops</small>`],
+    ['Reserve', chain.reserve == null ? '–' : `${fmtNum(chain.reserve / 1e6)}<small> XRP</small>`],
+    ['Validators', s.validators == null ? '–' : `${s.okV}<small> / ${s.validators}</small>`],
+    ['Peers', s.peers == null ? '–' : `${s.okP}<small> / ${s.peers}</small>`],
+    ['Agreement', s.agreement == null ? '–' : badge(s.agreement ? 'ok' : 'bad', s.agreement ? 'in sync' : 'diverged')],
+  ].map(([k, v]) => `<div class="stat"><div class="k">${k}</div><div class="v">${v}</div></div>`).join('');
+  const link = { live: ['ok', 'live'], connecting: ['dim', 'connecting'], reconnecting: ['warn', 'reconnecting'] }[chain.link];
+  document.getElementById('ws').outerHTML = `<span id="ws" class="badge ${link[0]}">${{ok:'●',warn:'▲',dim:'·'}[link[0]]} ${link[1]}</span>`;
+}
+
+function closeAge() {
+  if (chain.closedAt == null) return '–';
+  const secs = Math.max(0, Math.round((Date.now() - chain.closedAt) / 1000));
+  return `${secs}<small> s ago</small>`;
+}
+setInterval(() => { const el = document.getElementById('stat-close'); if (el) el.innerHTML = closeAge(); }, 1000);
+
+let streamUrl = null;
+function connectLedgerStream(endpoint) {
+  const url = endpoint || `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}`;
+  if (streamUrl) return;
+  streamUrl = url;
+  let delay = 1000;
+  const open = () => {
+    const sock = new WebSocket(streamUrl);
+    sock.onopen = () => {
+      delay = 1000;
+      chain.link = 'live';
+      sock.send(JSON.stringify({ id: 'subscribe', command: 'subscribe', streams: ['ledger', 'server'] }));
+      renderStats();
+    };
+    sock.onmessage = ev => {
+      const m = JSON.parse(ev.data);
+      const ledger = m.type === 'ledgerClosed' ? m : (m.id === 'subscribe' && m.result) ? m.result : null;
+      if (!ledger || ledger.ledger_index == null) return;
+      chain.seq = ledger.ledger_index;
+      chain.fee = ledger.fee_base ?? chain.fee;
+      chain.reserve = ledger.reserve_base ?? chain.reserve;
+      if (m.type === 'ledgerClosed') {
+        chain.txns = ledger.txn_count;
+        chain.closedAt = ledger.ledger_time != null ? RIPPLE_EPOCH_MS + ledger.ledger_time * 1000 : Date.now();
+      }
+      renderStats();
+    };
+    sock.onclose = () => { chain.link = 'reconnecting'; renderStats(); setTimeout(open, delay); delay = Math.min(delay * 2, 30000); };
+    sock.onerror = () => sock.close();
+  };
+  open();
 }
 
 async function poll() {
