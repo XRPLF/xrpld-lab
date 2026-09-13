@@ -12,6 +12,7 @@ from xrpld_lab.utils import (
     read_json,
     remove_directory,
     run_command,
+    save_config,
 )
 
 
@@ -104,3 +105,32 @@ class TestRemoveDirectory:
     def test_missing_returns_false(self, tmp_path, capsys):
         assert remove_directory(str(tmp_path / "missing")) is False
         assert "Not found" in capsys.readouterr().out
+
+
+class TestSaveConfig:
+    def test_writes_daemon_cfg_and_validators_txt(self, tmp_path):
+        cfg = "[server]\nport_rpc_admin_local\n"
+        vl = "[validators]\nnHB1X37qrniVugfQcuBTAjswphC1drx7QjFFojJPZwKHHnt8kU7v\n"
+
+        save_config("xrpl", str(tmp_path), cfg, vl)
+
+        # The daemon file name is "<protocol>d.cfg": protocol "xrpl" -> xrpld.cfg.
+        assert sorted(p.name for p in tmp_path.iterdir()) == [
+            "validators.txt",
+            "xrpld.cfg",
+        ]
+        assert (tmp_path / "xrpld.cfg").read_text() == cfg
+        assert (tmp_path / "validators.txt").read_text() == vl
+
+    def test_overwrites_existing_files(self, tmp_path):
+        (tmp_path / "xrpld.cfg").write_text("old")
+        (tmp_path / "validators.txt").write_text("old")
+
+        save_config("xrpl", str(tmp_path), "new cfg", "new vl")
+
+        assert (tmp_path / "xrpld.cfg").read_text() == "new cfg"
+        assert (tmp_path / "validators.txt").read_text() == "new vl"
+
+    def test_missing_directory_raises(self, tmp_path):
+        with pytest.raises(FileNotFoundError):
+            save_config("xrpl", str(tmp_path / "absent"), "cfg", "vl")
