@@ -138,6 +138,7 @@ class TestStandaloneRender:
         assert cfg["port_ws_admin_local"]["port"] == "6006"
         assert cfg["node_db"]["type"] == "NuDB"
         assert cfg["node_db"]["path"] == "/opt/ripple/lib/db"
+        assert cfg["database_path"] == "/opt/ripple/lib/db/rdb"
 
     def test_validators_txt_has_publisher_sections(self, standalone_tree):
         _, out = standalone_tree

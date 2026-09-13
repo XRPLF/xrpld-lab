@@ -42,7 +42,8 @@ class ComposeBuilder:
         - build context is the node directory name, dockerfile "Dockerfile"
         - platform: linux/x86_64
         - port mappings for all 5 ports
-        - volumes: ./name/config, ./name/log, ./name/lib -> /opt/ripple/*
+        - volumes: ./name/config, ./name/log, ./name/lib -> /opt/ripple/*,
+          ./name/db -> /var/lib/xrpld/db
 
         For standalone mode (network=False):
         - build context: ".", dockerfile: "Dockerfile"
@@ -60,6 +61,7 @@ class ComposeBuilder:
                     f"./{name}/config:/opt/ripple/config",
                     f"./{name}/log:/opt/ripple/log",
                     f"./{name}/lib:/opt/ripple/lib",
+                    f"./{name}/db:/var/lib/xrpld/db",
                 ],
                 "networks": [self.network_name],
             }
