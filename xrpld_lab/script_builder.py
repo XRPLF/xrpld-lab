@@ -223,6 +223,8 @@ done
         num_peers: int,
         binary_name: str = "xrpld",
         genesis: bool = True,
+        ws_node: str = "vnode1",
+        ws_port: int = 6106,
     ) -> str:
         """Local multi-node start: binary discovery, copy, nohup + PID files.
 
@@ -327,14 +329,14 @@ done
         s += "echo ''\n"
         s += "echo 'Each node is running in the background.'\n"
         s += (
-            "echo 'Use \"xrpld-netgen logs:local"
+            "echo 'Use \"xrpld-lab logs:local"
             ' --node <node_name>" to view logs'
             " (e.g., --node vnode1).'\n"
         )
         s += "echo 'Use \"./stop.sh\" to stop all nodes.'\n"
         s += "echo ''\n"
         s += "echo 'Explorer UI: http://localhost:4000'\n"
-        s += "echo 'Validator 1 WebSocket: ws://127.0.0.1:6016'\n"
+        s += f"echo '{ws_node} admin WebSocket: ws://127.0.0.1:{ws_port}'\n"
 
         return s
 
@@ -344,7 +346,7 @@ done
         num_validators: int,
         num_peers: int,
     ) -> str:
-        """Local multi-node stop: PID-based kill with fallback pkill.
+        """Local multi-node stop: kill each node by its PID file.
 
         Has ``--remove`` flag support for cleanup.
         """
@@ -380,11 +382,6 @@ done
             s += "  fi\n"
             s += f'  rm -f "$CLUSTER_DIR/vnode{i}/xrpld.pid"\n'
             s += "fi\n"
-            s += (
-                "# Fallback: Find and kill any xrpld"
-                f" process running in vnode{i} directory\n"
-            )
-            s += f'pkill -9 -f "vnode{i}/xrpld" 2>/dev/null || true\n'
 
         # Stop peer nodes
         s += "\n# Stop peer nodes\n"
@@ -402,11 +399,6 @@ done
             s += "  fi\n"
             s += f'  rm -f "$CLUSTER_DIR/pnode{i}/xrpld.pid"\n'
             s += "fi\n"
-            s += (
-                "# Fallback: Find and kill any xrpld"
-                f" process running in pnode{i} directory\n"
-            )
-            s += f'pkill -9 -f "pnode{i}/xrpld" 2>/dev/null || true\n'
 
         # Wait and Docker stop
         s += "\n# Wait for processes to terminate\n"

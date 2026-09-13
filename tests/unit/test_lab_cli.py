@@ -9,6 +9,7 @@ Covers:
 - main(): dispatch to LabRunner and operational commands
 """
 
+import argparse
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -19,7 +20,6 @@ from xrpld_lab.cli import (
     main,
     _flatten_ips,
     _DEFAULT_VL_KEY,
-    _XRPL_RELEASE_FALLBACK,
 )
 from xrpld_lab.models import (
     BuildType,
@@ -27,6 +27,7 @@ from xrpld_lab.models import (
     NodeDbType,
     Protocol,
 )
+from xrpld_lab.protocol import XRPL
 
 
 # -------------------------------------------------------------------------
@@ -298,13 +299,17 @@ class TestBuildParser:
         assert args.name == "my-cluster"
 
     def test_all_subcommands_present(self):
-        """Verify all 15 subcommands are registered."""
+        """The parser registers exactly the documented subcommands."""
         parser = _build_parser()
-        expected_commands = [
+        subparsers = next(
+            a for a in parser._actions if isinstance(a, argparse._SubParsersAction)
+        )
+        assert set(subparsers.choices) == {
             "up:standalone",
             "create:network",
             "create:ansible",
             "deploy:ansible",
+            "health",
             "up",
             "down",
             "remove",
@@ -313,57 +318,11 @@ class TestBuildParser:
             "down:local",
             "update:node",
             "vote:amendment",
+            "node:stall",
+            "node:restart",
             "logs:local",
             "logs:standalone",
-        ]
-        for cmd in expected_commands:
-            # Should not raise SystemExit
-            if cmd in (
-                "up:standalone",
-                "down:standalone",
-                "up:local",
-                "down:local",
-                "logs:local",
-                "logs:standalone",
-            ):
-                args = parser.parse_args([cmd])
-            elif cmd == "create:network":
-                args = parser.parse_args([cmd])
-            elif cmd == "create:ansible":
-                args = parser.parse_args(
-                    [cmd, "--vips", "1.2.3.4", "--pips", "5.6.7.8"]
-                )
-            elif cmd in ("up", "down", "remove", "deploy:ansible"):
-                args = parser.parse_args([cmd, "--name", "test"])
-            elif cmd == "update:node":
-                args = parser.parse_args(
-                    [
-                        cmd,
-                        "--name",
-                        "test",
-                        "--node_id",
-                        "1",
-                        "--node_type",
-                        "validator",
-                        "--build_server",
-                        "s",
-                        "--build_version",
-                        "v",
-                    ]
-                )
-            elif cmd == "vote:amendment":
-                args = parser.parse_args(
-                    [
-                        cmd,
-                        "--name",
-                        "test",
-                        "--amendment_name",
-                        "x",
-                        "--node_id",
-                        "1",
-                    ]
-                )
-            assert args.command == cmd
+        }
 
 
 # -------------------------------------------------------------------------
@@ -393,7 +352,7 @@ class TestBuildLabConfigStandalone:
     def test_xrpl_fallback_version(self):
         args = self._parse("--protocol", "xrpl")
         cfg = build_lab_config(args)
-        assert cfg.build_source.build_version == _XRPL_RELEASE_FALLBACK
+        assert cfg.build_source.build_version == XRPL.default_build_version
 
     # -- custom overrides --
 
@@ -418,6 +377,16 @@ class TestBuildLabConfigStandalone:
         args = self._parse("--network_id", "42")
         cfg = build_lab_config(args)
         assert cfg.network_id == 42
+
+    def test_network_id_zero_is_honoured(self):
+        args = self._parse("--network_id", "0")
+        cfg = build_lab_config(args)
+        assert cfg.network_id == 0
+
+    def test_network_id_defaults_to_the_standalone_id(self):
+        args = self._parse()
+        cfg = build_lab_config(args)
+        assert cfg.network_id == XRPL.default_standalone_network_id == 1
 
     def test_log_level_passed_through(self):
         args = self._parse("--log_level", "debug")
@@ -444,7 +413,7 @@ class TestBuildLabConfigStandalone:
     def test_xrpl_image_string(self):
         args = self._parse("--protocol", "xrpl")
         cfg = build_lab_config(args)
-        assert cfg.build_source.image == f"rippleci/xrpld:{_XRPL_RELEASE_FALLBACK}"
+        assert cfg.build_source.image == f"rippleci/xrpld:{XRPL.default_build_version}"
 
     # -- github owner/repo from spec --
 
@@ -479,7 +448,7 @@ class TestBuildLabConfigNetwork:
     def test_xrpl_network_defaults_to_the_release_image(self):
         cfg = build_lab_config(self._parse("--protocol", "xrpl"))
         assert cfg.build_source.build_type == BuildType.IMAGE
-        assert cfg.build_source.image == f"rippleci/xrpld:{_XRPL_RELEASE_FALLBACK}"
+        assert cfg.build_source.image == f"rippleci/xrpld:{XRPL.default_build_version}"
 
     def test_xrpl_ansible_image_flag_wins(self):
         args = _build_parser().parse_args(
@@ -550,13 +519,15 @@ class TestBuildLabConfigNetwork:
         cfg = build_lab_config(args)
         assert cfg.binary_name == "my-xrpld"
 
-    def test_network_id_from_spec_when_default(self):
-        """A falsy --network_id falls back to the spec default via
-        `args.network_id or spec.default_network_id`."""
+    def test_network_id_from_spec_when_omitted(self):
+        args = self._parse("--protocol", "xrpl")
+        cfg = build_lab_config(args)
+        assert cfg.network_id == XRPL.default_network_id == 1025
+
+    def test_network_id_zero_is_honoured(self):
         args = self._parse("--protocol", "xrpl", "--network_id", "0")
         cfg = build_lab_config(args)
-        # 0 is falsy, so spec default should be used
-        assert cfg.network_id == 1025
+        assert cfg.network_id == 0
 
     # -- GitHub URL mode (custom XRPL builds) --
 
@@ -1088,6 +1059,11 @@ class TestBuildLabConfigAnsible:
 class TestMain:
     """Test main() dispatches correctly."""
 
+    @pytest.fixture(autouse=True)
+    def _run_in_tmp_dir(self, tmp_path, monkeypatch):
+        """main() builds Workspace() under the cwd; keep that out of the repo."""
+        monkeypatch.chdir(tmp_path)
+
     @patch("xrpld_lab.cli.run_start_script")
     @patch("xrpld_lab.cli.LabRunner")
     @patch("xrpld_lab.cli.build_lab_config")
@@ -1227,7 +1203,28 @@ class TestMain:
             main()
 
         mock_run.assert_called_once()
-        assert mock_run.call_args.kwargs["network_id"] is None
+        assert mock_run.call_args.kwargs["network_type"] == "standalone"
+        assert (
+            mock_run.call_args.kwargs["network_id"]
+            == XRPL.default_standalone_network_id
+            == 1
+        )
+
+    @patch("xrpld_lab.cli.start_local")
+    @patch("xrpld_lab.cli.Workspace")
+    def test_up_local_network_type_uses_network_default(self, mock_ws_cls, mock_run):
+        with patch("sys.argv", ["xrpld-lab", "up:local", "--network_type", "network"]):
+            main()
+
+        assert mock_run.call_args.kwargs["network_id"] == XRPL.default_network_id
+
+    @patch("xrpld_lab.cli.start_local")
+    @patch("xrpld_lab.cli.Workspace")
+    def test_up_local_explicit_network_id_zero(self, mock_ws_cls, mock_run):
+        with patch("sys.argv", ["xrpld-lab", "up:local", "--network_id", "0"]):
+            main()
+
+        assert mock_run.call_args.kwargs["network_id"] == 0
 
     @patch("xrpld_lab.cli.stop_local")
     @patch("xrpld_lab.cli.Workspace")

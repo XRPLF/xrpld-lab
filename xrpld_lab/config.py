@@ -35,6 +35,8 @@ def parse_xrpld_cfg(content: str) -> Dict[str, Any]:
             return
         value = _parse_section_lines(section_lines)
         if value is not None:
+            if current_section in result:
+                value = _append_section(result[current_section], value)
             result[current_section] = value
         current_section = None
         section_lines = []
@@ -79,6 +81,22 @@ def _parse_section_lines(section_lines: list[str]) -> Any:
     if len(lines) == 1:
         return lines[0]
     return lines
+
+
+def _append_section(existing: Any, new: Any) -> Any:
+    """Combine a repeated section the way xrpld does: keys merge, lines append."""
+    if isinstance(existing, dict) and isinstance(new, dict):
+        return {**existing, **new}
+    return _section_lines(existing) + _section_lines(new)
+
+
+def _section_lines(value: Any) -> list:
+    """A section value as its list of lines."""
+    if isinstance(value, dict):
+        return [f"{k} = {v}" for k, v in value.items()]
+    if isinstance(value, list):
+        return list(value)
+    return [value]
 
 
 def _render_section(name: str, value: Any) -> str:

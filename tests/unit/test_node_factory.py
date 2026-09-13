@@ -542,6 +542,19 @@ class TestCreatePeer:
 class TestCreateLocalValidator:
     """Tests for NodeFactory.create_local_validator."""
 
+    def test_vl_site_is_the_published_loopback_port(self, three_validators):
+        node = NodeFactory.create_local_validator(
+            index=1,
+            protocol=Protocol.XRPL,
+            name="local_vl1",
+            network_id=21337,
+            token="TOKEN1",
+            all_validators=three_validators,
+            vl_key="VL_KEY",
+        )
+        assert node.vl_sites == ["http://127.0.0.1/vl.json"]
+        assert node.vl_keys == ["VL_KEY"]
+
     def test_db_path_is_local(self, three_validators):
         node = NodeFactory.create_local_validator(
             index=1,
@@ -654,6 +667,18 @@ class TestCreateLocalValidator:
 
 class TestCreateLocalPeer:
     """Tests for NodeFactory.create_local_peer."""
+
+    def test_vl_site_is_the_published_loopback_port(self, three_validators):
+        node = NodeFactory.create_local_peer(
+            index=1,
+            protocol=Protocol.XRPL,
+            name="local_peer1",
+            network_id=21337,
+            validators=three_validators,
+            vl_key="VL_KEY",
+        )
+        assert node.vl_sites == ["http://127.0.0.1/vl.json"]
+        assert node.vl_keys == ["VL_KEY"]
 
     def test_role_is_peer(self, three_validators):
         node = NodeFactory.create_local_peer(

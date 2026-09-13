@@ -293,6 +293,19 @@ class TestScriptBuilderLocalNetwork:
         assert "vnode1" in result
         assert "vnode2" in result
         assert "pnode1" in result
+        assert 'Use "xrpld-lab logs:local --node <node_name>"' in result
+        assert "xrpld-netgen" not in result
+
+    def test_local_network_start_names_the_explorer_endpoint(self):
+        result = ScriptBuilder.local_network_start(
+            name="local-net",
+            num_validators=2,
+            num_peers=1,
+            ws_node="pnode1",
+            ws_port=7016,
+        )
+        assert "echo 'pnode1 admin WebSocket: ws://127.0.0.1:7016'" in result
+        assert "6016" not in result
 
     def test_local_network_start_no_genesis(self):
         """Without genesis: no --ledgerfile or --valid flags."""
@@ -320,7 +333,7 @@ class TestScriptBuilderLocalNetwork:
         assert "nohup ./rippled" in result
 
     def test_local_network_stop(self):
-        """PID kill, pkill fallback, Docker stop."""
+        """PID-file kill and Docker stop; no process-name matching."""
         result = ScriptBuilder.local_network_stop(
             name="local-net",
             num_validators=2,
@@ -333,10 +346,10 @@ class TestScriptBuilderLocalNetwork:
         assert "xrpld.pid" in result
         assert "kill $PID" in result
         assert "kill -9 $PID" in result
-        # pkill fallback
-        assert 'pkill -9 -f "vnode1/xrpld"' in result
-        assert 'pkill -9 -f "vnode2/xrpld"' in result
-        assert 'pkill -9 -f "pnode1/xrpld"' in result
+        assert 'PID=$(cat "$CLUSTER_DIR/vnode1/xrpld.pid")' in result
+        assert 'PID=$(cat "$CLUSTER_DIR/vnode2/xrpld.pid")' in result
+        assert 'PID=$(cat "$CLUSTER_DIR/pnode1/xrpld.pid")' in result
+        assert "pkill" not in result
         # Docker stop
         assert "docker compose -f docker-compose.yml down --remove-orphans" in result
         assert "docker compose -f docker-compose.yml down\n" in result
