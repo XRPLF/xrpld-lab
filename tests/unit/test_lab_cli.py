@@ -82,7 +82,7 @@ class TestBuildParser:
         assert args.network_id is None
         assert args.build_server is None
         assert args.build_version is None
-        assert args.genesis is False
+        assert args.genesis is None
         assert args.quorum is None
         assert args.nodedb_type == "NuDB"
         assert args.local is False
@@ -1560,7 +1560,7 @@ class TestGenesisFlagParsing:
 
     def test_default_is_false(self):
         parser = _build_parser()
-        assert parser.parse_args(["create:network"]).genesis is False
+        assert parser.parse_args(["create:network"]).genesis is None
 
     def test_garbage_rejected(self):
         parser = _build_parser()

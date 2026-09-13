@@ -572,7 +572,9 @@ class LabConfig:
     num_peers: int = 0
     # Shifts every node port, so a candidate cluster can run beside an existing one.
     port_offset: int = 0
-    genesis: bool = False
+    # None: fresh chain when the workspace has no keystore for the cluster,
+    # preserve when it has one. True or False forces either.
+    genesis: Optional[bool] = None
     # Boot nodes with --load from a snapshot-restored database directory instead of
     # a genesis JSON (large prefunded state, see loadtester snapshot_push.sh).
     db_seed: bool = False

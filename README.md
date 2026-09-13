@@ -84,7 +84,7 @@ xrpld-lab create:network [OPTIONS]
 | `--build_server` | auto | Build server URL or GitHub branch URL |
 | `--network_id` | `1025` | Network identifier |
 | `--log_level` | `trace` | `warning`, `debug`, `trace` |
-| `--genesis` | `false` | Genesis mode |
+| `--genesis` | auto | `True`: fresh chain; `False`: preserve; unset: fresh when the workspace has no keystore for the cluster, preserve when it has one |
 | `--quorum` | `n-1` | Consensus quorum |
 | `--nodedb_type` | `NuDB` | `NuDB` (persistent) or `Memory` (fast) |
 | `--local` | off | Run as native processes (no Docker for nodes) |

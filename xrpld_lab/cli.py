@@ -94,10 +94,11 @@ def _add_network_args(p: argparse.ArgumentParser) -> None:
     p.add_argument(
         "--genesis",
         type=_parse_bool,
-        default=False,
+        default=None,
         help="True: fresh chain from a generated genesis (deploy wipes node "
-        "state). False: join/preserve — nodes keep their db and boot "
-        "normally.",
+        "state). False: join/preserve; nodes keep their db and boot from it. "
+        "Unset: fresh when this workspace has no keystore for the cluster, "
+        "preserve when it has one.",
     )
     p.add_argument(
         "--db_seed",
@@ -954,7 +955,7 @@ def _deploy_ansible(workspace: Workspace, name: str) -> bool:
     import os
     import subprocess
 
-    cluster_dir = workspace.cluster_dir(name)
+    cluster_dir = workspace.cluster_path(name)
     ansible_dir = os.path.join(cluster_dir, "ansible")
     run_sh = os.path.join(ansible_dir, "run.sh")
 
