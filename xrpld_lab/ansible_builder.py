@@ -114,8 +114,8 @@ class AnsibleBuilder:
             "",
             "# this is a basic file putting different hosts into categories",
             "# used by ansible to determine which actions to run on which hosts",
-            "[all]",
-            "    ",
+            "# nodes: every validator and peer; the node playbooks target this group",
+            "[nodes]",
         ]
         for node in self._nodes:
             lines.append(self._host_line(node.ip))
@@ -797,7 +797,7 @@ class AnsibleBuilder:
 # ======================================================================
 
 _DEPS_YML = """---
-- hosts: all
+- hosts: nodes
   become: true
   remote_user: root
   tasks:
@@ -837,7 +837,7 @@ _DEPS_YML = """---
       group: docker
 """
 
-_MAIN_HEADER = """- hosts: all
+_MAIN_HEADER = """- hosts: nodes
   become: true
   remote_user: root
 
@@ -857,7 +857,7 @@ _MAIN_HEADER = """- hosts: all
 
 # Rolling variant: one host at a time so the network keeps quorum, no docker daemon
 # restart (it would bounce the running node), no state reset.
-_MAIN_HEADER_ROLLING = """- hosts: all
+_MAIN_HEADER_ROLLING = """- hosts: nodes
   become: true
   remote_user: root
   serial: 1
@@ -935,7 +935,7 @@ _MAIN_DEPLOY_TASKS = """  - name: Create Docker Network
 # namespace
 # down, which is why this runs after every main.yml.
 _ALLOY_YML = """---
-- hosts: all
+- hosts: nodes
   become: true
   remote_user: root
 
@@ -981,7 +981,7 @@ _ALLOY_YML = """---
       msg: "alloy={{ alloy_state.stdout }}"
 """
 
-_CLEAN_YML = """- hosts: all
+_CLEAN_YML = """- hosts: nodes
   become: true
   remote_user: root
 
@@ -1780,7 +1780,7 @@ _STATUS_NGINX_ZONE = (
 # %}.
 # ufw on the nodes defaults to allow incoming, so each allow rule is followed by a deny.
 _STATUS_YML = """---
-- hosts: all
+- hosts: nodes
   become: true
   remote_user: root
 

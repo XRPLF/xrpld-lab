@@ -150,6 +150,12 @@ services:
       port: 8687
 ```
 
+`hosts.txt` lists every validator and peer under the `nodes` group, which the node
+playbooks (`deps.yml`, `main.yml`, `clean.yml`, `alloy.yml`, `status.yml`) target; each
+services host is its own group, targeted only by its service playbooks. A services host
+whose IP is not in `vips` or `pips` is therefore never touched by a node playbook; one that
+is also a node sits in both groups.
+
 **Status service** (`status:` on the services host, which must be one of the nodes). Every
 node gets `node_metrics.py` as the `xrpld-status` systemd unit: it samples `/proc`, the
 admin RPC `server_info` and the XDGM datagram into a SQLite ring buffer and serves a
