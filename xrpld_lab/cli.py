@@ -784,6 +784,7 @@ def _build_network_config(args, protocol, spec):
     elif has_local:
         server = server or "https://github.com/XRPLF/rippled/tree"
         version = version or spec.default_build_version
+        binary_path = args.binary_path or ""
         build_type = BuildType.BINARY
     else:
         server = server or spec.default_build_server

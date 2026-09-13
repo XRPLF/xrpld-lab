@@ -9,6 +9,7 @@ import pathlib
 from unittest.mock import MagicMock, patch, call
 
 import pytest
+import requests
 
 from xrpld_lab.models import (
     LabConfig,
@@ -669,10 +670,17 @@ class TestRunLocalNetwork:
     """_run_local_network orchestration with mocks."""
 
     @pytest.fixture(autouse=True)
-    def setup_patches(self, local_lab, tmp_workspace, mock_features, mock_genesis):
+    def setup_patches(
+        self, local_lab, tmp_workspace, mock_features, mock_genesis, tmp_path
+    ):
         self.lab = local_lab
         self.workspace = tmp_workspace
         self.runner = LabRunner(local_lab, workspace=tmp_workspace)
+
+        # A real binary on disk: the isfile check runs unpatched
+        self.binary = tmp_path / "xrpld-build"
+        self.binary.write_text("#!/bin/sh\n")
+        local_lab.build_source.binary_path = str(self.binary)
 
         self.patches = {}
         self.mocks = {}
@@ -865,6 +873,84 @@ class TestRunLocalNetwork:
     def test_signs_unl(self):
         self.runner._run_local_network()
         self.mock_publisher_instance.sign_unl.assert_called_once()
+
+    # -- inputs: features and binary --
+
+    def _cluster(self):
+        return pathlib.Path(self.workspace.cluster_path("local-xrpl"))
+
+    def _checkout_candidate(self):
+        return os.path.join("..", get_spec(Protocol.XRPL).feature_paths[0])
+
+    def test_features_file_is_read_instead_of_the_checkout(self, tmp_path):
+        self.lab.features_file = str(tmp_path / "features.macro")
+        self.runner._run_local_network()
+        self.mocks["get_feature_lines_path"].assert_called_once_with(
+            self.lab.features_file
+        )
+
+    def test_missing_features_file_leaves_no_directory(self, tmp_path):
+        self.lab.features_file = str(tmp_path / "absent.macro")
+        self.mocks["get_feature_lines_path"].side_effect = FileNotFoundError("absent")
+        with pytest.raises(FileNotFoundError):
+            self.runner._run_local_network()
+        assert not self._cluster().exists()
+
+    def test_commit_ref_fetches_features_from_github(self):
+        self.lab.build_source.commit_hash = "abc123"
+        with patch.object(
+            self.runner.resolver, "resolve_features", return_value=b"line1\nline2"
+        ) as resolve:
+            self.runner._run_local_network()
+        resolve.assert_called_once()
+        self.mocks["get_feature_lines_path"].assert_not_called()
+        assert self.mocks["parse_amendments"].call_args.args[0] == ["line1", "line2"]
+
+    def test_failed_fetch_falls_back_to_the_checkout(self, capsys):
+        self.lab.build_source.commit_hash = "abc123"
+        with patch.object(
+            self.runner.resolver,
+            "resolve_features",
+            side_effect=requests.ConnectionError("offline"),
+        ):
+            self.runner._run_local_network()
+        self.mocks["get_feature_lines_path"].assert_called_once_with(
+            self._checkout_candidate()
+        )
+        assert "could not fetch features at abc123" in capsys.readouterr().out
+
+    def test_no_ref_reads_the_checkout(self):
+        self.runner._run_local_network()
+        self.mocks["get_feature_lines_path"].assert_called_once_with(
+            self._checkout_candidate()
+        )
+
+    def test_no_ref_and_no_checkout_leaves_no_directory(self):
+        self.mocks["path_exists"].return_value = False
+        with pytest.raises(FileNotFoundError, match="no features.macro"):
+            self.runner._run_local_network()
+        assert not self._cluster().exists()
+
+    def test_binary_path_is_staged_in_the_cluster_dir(self):
+        self.runner._run_local_network()
+        self.mocks["copy2"].assert_any_call(
+            str(self.binary), str(self._cluster() / "xrpld")
+        )
+
+    def test_binary_defaults_to_the_working_directory(self, tmp_path, monkeypatch):
+        self.lab.build_source.binary_path = ""
+        (tmp_path / "xrpld").write_text("#!/bin/sh\n")
+        monkeypatch.chdir(tmp_path)
+        self.runner._run_local_network()
+        self.mocks["copy2"].assert_any_call(
+            str(tmp_path / "xrpld"), str(self._cluster() / "xrpld")
+        )
+
+    def test_missing_binary_leaves_no_directory(self, tmp_path):
+        self.lab.build_source.binary_path = str(tmp_path / "absent")
+        with pytest.raises(FileNotFoundError, match="binary not found"):
+            self.runner._run_local_network()
+        assert not self._cluster().exists()
 
 
 # ---------------------------------------------------------------------------
