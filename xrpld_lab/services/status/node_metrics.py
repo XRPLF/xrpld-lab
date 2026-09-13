@@ -37,6 +37,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 SECTOR_BYTES = 512
+# Root of the procfs tree; tests point it at a directory of captured files.
+PROC = "/proc"
 
 XDGM_MAGIC = 0x4D474458  # 'XDGM'
 XDGM_HEADER_SIZE = 652
@@ -258,7 +260,7 @@ CREATE INDEX IF NOT EXISTS events_ts ON events (ts);
 # ------------------------------------------------------------------ host readings
 def read_proc_stat():
     """Aggregate jiffy counters from /proc/stat: (total, idle+iowait, iowait)."""
-    with open("/proc/stat") as fh:
+    with open(f"{PROC}/stat") as fh:
         parts = fh.readline().split()
     v = [int(x) for x in parts[1:]]
     idle = v[3] + v[4]
@@ -267,7 +269,7 @@ def read_proc_stat():
 
 def read_meminfo():
     out = {}
-    with open("/proc/meminfo") as fh:
+    with open(f"{PROC}/meminfo") as fh:
         for line in fh:
             k, _, rest = line.partition(":")
             out[k] = int(rest.split()[0]) * 1024
@@ -278,7 +280,7 @@ def read_diskstats():
     """Bytes read and written across whole disks; partitions are skipped to avoid
     double-counting the same IO."""
     read_b = write_b = 0
-    with open("/proc/diskstats") as fh:
+    with open(f"{PROC}/diskstats") as fh:
         for line in fh:
             f = line.split()
             name = f[2]
@@ -291,7 +293,7 @@ def read_diskstats():
 
 def read_netdev():
     rx = tx = 0
-    with open("/proc/net/dev") as fh:
+    with open(f"{PROC}/net/dev") as fh:
         for line in fh.read().splitlines()[2:]:
             name, _, rest = line.partition(":")
             if name.strip() == "lo":
@@ -305,15 +307,15 @@ def read_netdev():
 def find_pid(name):
     """Pid of the process whose executable is `name`. Matched on argv[0], because xrpld
     renames its main thread and /proc/<pid>/comm reads `xrpld-main`."""
-    for entry in os.listdir("/proc"):
+    for entry in os.listdir(PROC):
         if not entry.isdigit():
             continue
         try:
-            with open(f"/proc/{entry}/cmdline", "rb") as fh:
+            with open(f"{PROC}/{entry}/cmdline", "rb") as fh:
                 argv0 = fh.read().split(b"\x00", 1)[0]
             if argv0 and os.path.basename(argv0.decode("utf-8", "replace")) == name:
                 return int(entry)
-            with open(f"/proc/{entry}/comm") as fh:
+            with open(f"{PROC}/{entry}/comm") as fh:
                 if fh.read().strip().split("-")[0] == name:
                     return int(entry)
         except OSError:
@@ -323,7 +325,7 @@ def find_pid(name):
 
 def read_rss(pid):
     try:
-        with open(f"/proc/{pid}/status") as fh:
+        with open(f"{PROC}/{pid}/status") as fh:
             for line in fh:
                 if line.startswith("VmRSS:"):
                     return int(line.split()[1]) * 1024
@@ -438,7 +440,7 @@ class Sampler:
         swap_total = mem.get("SwapTotal", 0)
         swap_used = swap_total - mem.get("SwapFree", 0)
 
-        with open("/proc/loadavg") as fh:
+        with open(f"{PROC}/loadavg") as fh:
             la = fh.read().split()
 
         st = os.statvfs(self.cfg.disk_path)
