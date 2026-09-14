@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Breaking
+- Keys, tokens, domain attestations, manifests and the signed validator list come from rippled's `validator-keys` tool, run as a subprocess; the `xrpld-publisher` Python package is no longer a dependency. The tool is found through `VALIDATOR_KEYS_BIN`, beside the xrpld binary named by `--binary_path`, on `PATH`, or at `/opt/xrpld/bin/validator-keys` inside the cluster's docker image.
+- A `keystore/vl/key.json` written by the `xrpld-publisher` package (no `key_type` field) is refused: run `xrpld-publisher migrate-keys` on it, or redeploy as genesis.
+
+### Changed
+- The keystore keeps the tool's own files: `keystore/vl/{key.json, token.txt, manifest.txt}` for the publisher (an ed25519 signing key) and `keystore/vnodeN/{key.json, token.txt, manifest.txt, attestation.txt}` for each validator. `[validator_list_keys]` carries the publisher's master key as hex.
+- The signed list is built from `vl/unsigned.json` (sequence = signing time in unix seconds, expiration 30 days later), signed with `sign_list` and checked with `verify_list` before the workflow completes.
+
 ## 5.0.0
 
 ### Breaking

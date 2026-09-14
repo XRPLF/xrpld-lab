@@ -1,5 +1,5 @@
 """Render tests: run the real LabRunner into a temporary workspace and inspect
-the files it writes. Only GitHub fetches and key generation are replaced."""
+the files it writes. Only GitHub fetches and the validator-keys tool are replaced."""
 
 from __future__ import annotations
 
@@ -19,6 +19,8 @@ from xrpld_lab.source_resolver import SourceResolver
 from xrpld_lab.workflows import LabRunner
 from xrpld_lab.workspace import Workspace
 
+from tests.unit.keytool_double import PUBLIC_KEYS, PUBLIC_KEYS_HEX, FakeKeyTool
+
 SUPPORTED_FEATURE = "PermissionedDEX"
 UNSUPPORTED_FEATURE = "Clawback"
 
@@ -29,61 +31,12 @@ FEATURES_MACRO = (
     f"XRPL_FEATURE({UNSUPPORTED_FEATURE}, Supported::no, VoteBehavior::DefaultNo)\n"
 ).encode("utf-8")
 
-PUBLISHER_KEY = "ED0000000000000000000000000000000000000000000000000000000000000001"
-VALIDATOR_KEYS = {
-    "vnode1": "nHValidatorOnePublicKeyBase58",
-    "vnode2": "nHValidatorTwoPublicKeyBase58",
-}
+PUBLISHER_KEY = PUBLIC_KEYS_HEX["vl"]
+VALIDATOR_KEYS = {node: PUBLIC_KEYS[node] for node in ("vnode1", "vnode2")}
 
 DOCKER_COMPOSE_UP = (
     "docker compose -f docker-compose.yml up --build --force-recreate -d"
 )
-
-
-class FakePublisherClient:
-    """PublisherClient stand-in: keys live in memory, sign_unl writes the path."""
-
-    def __init__(self, vl_path=None):
-        self.keys = None
-        self.manifests = []
-
-    def get_keys(self):
-        return self.keys
-
-    def create_keys(self, vl_algorithm="ed25519", eph_algorithm="ed25519"):
-        self.keys = {"publicKey": PUBLISHER_KEY}
-
-    def add_validator(self, manifest):
-        self.manifests.append(manifest)
-
-    def sign_unl(self, path, effective=None, expiration=None):
-        with open(path, "w") as f:
-            json.dump({"public_key": PUBLISHER_KEY, "manifests": self.manifests}, f)
-
-
-class FakeValidatorClient:
-    """ValidatorClient stand-in returning one fixed identity per node name."""
-
-    def __init__(self, name):
-        self.name = name
-
-    def create_keys(self, algorithm="ed25519"):
-        pass
-
-    def set_domain(self, domain):
-        pass
-
-    def create_token(self, ephemeral_algorithm="secp256k1"):
-        pass
-
-    def get_keys(self):
-        return {"public_key": VALIDATOR_KEYS[self.name]}
-
-    def read_token(self):
-        return f"token-{self.name}"
-
-    def read_manifest(self):
-        return f"manifest-{self.name}"
 
 
 def _lab_config(argv):
@@ -199,14 +152,14 @@ def network_tree(tmp_path):
             "1",
             "--genesis",
             "True",
+            "--bootstrap_vl",
             "--workspace",
             str(tmp_path),
         ]
     )
     with (
         patch.object(SourceResolver, "resolve_features", return_value=FEATURES_MACRO),
-        patch("xrpld_lab.workflows.PublisherClient", FakePublisherClient),
-        patch("xrpld_lab.workflows.ValidatorClient", FakeValidatorClient),
+        patch("xrpld_lab.workflows.KeyTool", FakeKeyTool),
     ):
         LabRunner(lab, Workspace(base=str(tmp_path))).run()
     return lab, tmp_path / "3.3.0-cluster"
@@ -259,6 +212,26 @@ class TestNetworkRender:
         assert trusted("vnode2") == [VALIDATOR_KEYS["vnode1"]]
         assert set(trusted("pnode1")) == set(VALIDATOR_KEYS.values())
 
+    def test_every_node_trusts_the_publisher_key_as_hex(self, network_tree):
+        _, cluster = network_tree
+        for node in NETWORK_NODES:
+            text = (cluster / node / "config" / "validators.txt").read_text()
+            assert parse_xrpld_cfg(text)["validator_list_keys"] == PUBLISHER_KEY
+
+    def test_keystore_holds_every_identity(self, network_tree):
+        _, cluster = network_tree
+        keystore = cluster / "keystore"
+        assert json.loads((keystore / "vl" / "key.json").read_text())["public_key"] == (
+            PUBLIC_KEYS["vl"]
+        )
+        assert "token-vl-ed25519" in (keystore / "vl" / "token.txt").read_text()
+        assert (keystore / "vl" / "manifest.txt").read_text() == "manifest-vl\n"
+        for node in ("vnode1", "vnode2"):
+            assert (keystore / node / "key.json").is_file()
+            assert f"token-{node}" in (keystore / node / "token.txt").read_text()
+            assert (keystore / node / "manifest.txt").is_file()
+            assert (keystore / node / "attestation.txt").is_file()
+
     def test_validator_cfg_carries_its_own_token(self, network_tree):
         _, cluster = network_tree
         for node in ("vnode1", "vnode2"):
@@ -277,6 +250,13 @@ class TestNetworkRender:
         assert (cluster / "vl" / "Dockerfile").is_file()
         signed = json.loads((cluster / "vl" / "vl.json").read_text())
         assert signed["manifests"] == ["manifest-vnode1", "manifest-vnode2"]
+        assert signed["token_file"] == "keystore/vl/token.txt"
+        unsigned = json.loads((cluster / "vl" / "unsigned.json").read_text())
+        assert [v["validation_public_key"] for v in unsigned["validators"]] == [
+            PUBLIC_KEYS_HEX["vnode1"],
+            PUBLIC_KEYS_HEX["vnode2"],
+        ]
+        assert unsigned["sequence"] == signed["sequence"]
 
     def test_compose_has_nodes_vl_and_explorer(self, network_tree):
         _, cluster = network_tree
@@ -315,8 +295,7 @@ def _run_local(tmp_path, extra):
             "resolve_features",
             side_effect=AssertionError("fetched from GitHub"),
         ),
-        patch("xrpld_lab.workflows.PublisherClient", FakePublisherClient),
-        patch("xrpld_lab.workflows.ValidatorClient", FakeValidatorClient),
+        patch("xrpld_lab.workflows.KeyTool", FakeKeyTool),
     ):
         LabRunner(lab, Workspace(base=str(tmp_path))).run()
     return tmp_path / LOCAL_CLUSTER
@@ -476,8 +455,7 @@ def preloaded_network_tree(tmp_path):
     )
     with (
         patch.object(SourceResolver, "resolve_features", return_value=FEATURES_MACRO),
-        patch("xrpld_lab.workflows.PublisherClient", FakePublisherClient),
-        patch("xrpld_lab.workflows.ValidatorClient", FakeValidatorClient),
+        patch("xrpld_lab.workflows.KeyTool", FakeKeyTool),
     ):
         LabRunner(lab, Workspace(base=str(tmp_path))).run()
     return tmp_path / "3.3.0-cluster"

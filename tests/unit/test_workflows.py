@@ -26,10 +26,23 @@ from xrpld_lab.protocol import get_spec, XRPL
 from xrpld_lab.workspace import Workspace
 from xrpld_lab.workflows import LabRunner, explorer_target
 
+from tests.unit.keytool_double import FakeKeyTool
+
 
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
+KEY_FILE = {"key_type": "ed25519", "public_key": "VALKEY"}
+
+
+def _key_tool_double(tool):
+    """A KeyTool instance whose keystore already holds every key."""
+    tool.read_keys.return_value = KEY_FILE
+    tool.public_key_hex.return_value = "VALKEYHEX"
+    tool.read_token.return_value = "token"
+    tool.read_manifest.return_value = "manifest"
+    return tool
 
 
 @pytest.fixture
@@ -582,25 +595,12 @@ class TestRunNetwork:
         self.mocks["chmod"] = p.start()
         self.patches["chmod"] = p
 
-        # Mock VL key generation (PublisherClient and ValidatorClient)
-        mock_publisher = MagicMock()
-        mock_publisher.return_value.get_keys.return_value = {
-            "publicKey": "ED_VL_PUB_KEY",
-        }
-        p = patch("xrpld_lab.workflows.PublisherClient", mock_publisher)
-        self.mocks["publisher_client"] = p.start()
-        self.patches["publisher_client"] = p
-        self.mock_publisher_instance = mock_publisher.return_value
-
-        mock_validator = MagicMock()
-        mock_validator.return_value.get_keys.return_value = {
-            "public_key": "ED_VAL_PUB_KEY",
-        }
-        mock_validator.return_value.read_token.return_value = "TOKEN_DATA"
-        mock_validator.return_value.read_manifest.return_value = "MANIFEST_DATA"
-        p = patch("xrpld_lab.workflows.ValidatorClient", mock_validator)
-        self.mocks["validator_client"] = p.start()
-        self.patches["validator_client"] = p
+        # Key generation and list signing (KeyTool)
+        mock_tool = MagicMock()
+        p = patch("xrpld_lab.workflows.KeyTool", mock_tool)
+        self.mocks["key_tool"] = p.start()
+        self.patches["key_tool"] = p
+        self.mock_tool_instance = _key_tool_double(mock_tool.return_value)
 
         # shutil.copyfile
         p = patch("xrpld_lab.workflows.shutil.copyfile")
@@ -614,8 +614,8 @@ class TestRunNetwork:
 
     def test_creates_vl_keys(self):
         self.runner._run_network()
-        self.mocks["publisher_client"].assert_called()
-        self.mock_publisher_instance.get_keys.assert_called()
+        self.mocks["key_tool"].assert_called_once()
+        self.mock_tool_instance.read_keys.assert_any_call("keystore/vl/key.json")
 
     def test_generates_validator_nodes(self):
         self.runner._run_network()
@@ -650,7 +650,7 @@ class TestRunNetwork:
 
     def test_signs_unl(self):
         self.runner._run_network()
-        self.mock_publisher_instance.sign_unl.assert_called_once()
+        self.mock_tool_instance.publish_list.assert_called_once()
 
     def test_copies_nginx_dockerfile(self):
         self.runner._run_network()
@@ -787,25 +787,12 @@ class TestRunLocalNetwork:
         self.mocks["chmod"] = p.start()
         self.patches["chmod"] = p
 
-        # VL key generation
-        mock_publisher = MagicMock()
-        mock_publisher.return_value.get_keys.return_value = {
-            "publicKey": "ED_VL_PUB_KEY",
-        }
-        p = patch("xrpld_lab.workflows.PublisherClient", mock_publisher)
-        self.mocks["publisher_client"] = p.start()
-        self.patches["publisher_client"] = p
-        self.mock_publisher_instance = mock_publisher.return_value
-
-        mock_validator = MagicMock()
-        mock_validator.return_value.get_keys.return_value = {
-            "public_key": "ED_VAL_PUB_KEY",
-        }
-        mock_validator.return_value.read_token.return_value = "TOKEN_DATA"
-        mock_validator.return_value.read_manifest.return_value = "MANIFEST_DATA"
-        p = patch("xrpld_lab.workflows.ValidatorClient", mock_validator)
-        self.mocks["validator_client"] = p.start()
-        self.patches["validator_client"] = p
+        # Key generation and list signing (KeyTool)
+        mock_tool = MagicMock()
+        p = patch("xrpld_lab.workflows.KeyTool", mock_tool)
+        self.mocks["key_tool"] = p.start()
+        self.patches["key_tool"] = p
+        self.mock_tool_instance = _key_tool_double(mock_tool.return_value)
 
         # shutil.copyfile
         p = patch("xrpld_lab.workflows.shutil.copyfile")
@@ -872,7 +859,7 @@ class TestRunLocalNetwork:
 
     def test_signs_unl(self):
         self.runner._run_local_network()
-        self.mock_publisher_instance.sign_unl.assert_called_once()
+        self.mock_tool_instance.publish_list.assert_called_once()
 
     # -- inputs: features and binary --
 
@@ -995,8 +982,7 @@ def _ansible_config():
 
 _NETWORK_PATCH_TARGETS = [
     ("resolver", "xrpld_lab.workflows.SourceResolver"),
-    ("publisher", "xrpld_lab.workflows.PublisherClient"),
-    ("validator_client", "xrpld_lab.workflows.ValidatorClient"),
+    ("key_tool", "xrpld_lab.workflows.KeyTool"),
     ("node_factory", "xrpld_lab.workflows.NodeFactory"),
     ("cfg_builder", "xrpld_lab.workflows.XrpldCfgBuilder"),
     ("vl_builder", "xrpld_lab.workflows.ValidatorsTxtBuilder"),
@@ -1045,15 +1031,7 @@ class _NetworkRunnerSetup:
         self.mocks["script_start"].return_value = "#!/bin/bash"
         self.mocks["script_stop"].return_value = "#!/bin/bash"
 
-        mock_pub = MagicMock()
-        mock_pub.get_keys.return_value = {"publicKey": "EDPUBKEY"}
-        self.mocks["publisher"].return_value = mock_pub
-
-        mock_vc = MagicMock()
-        mock_vc.get_keys.return_value = {"public_key": "VALKEY"}
-        mock_vc.read_token.return_value = "token"
-        mock_vc.read_manifest.return_value = "manifest"
-        self.mocks["validator_client"].return_value = mock_vc
+        self.tool = _key_tool_double(self.mocks["key_tool"].return_value)
 
         mock_node = _make_node("vnode1", NodeRole.VALIDATOR)
         self.mocks["node_factory"].create_validator.return_value = mock_node
@@ -1150,15 +1128,58 @@ class TestNonGenesisNetwork(_NetworkRunnerSetup):
 
     def test_missing_vl_keys_refused_on_preserve(self):
         self.lab.genesis = False
-        self.mocks["publisher"].return_value.get_keys.return_value = None
+        self.tool.read_keys.return_value = None
         with pytest.raises(RuntimeError, match="no VL publisher keys"):
             LabRunner(self.lab, self.workspace).run()
+        self.tool.create_keys.assert_not_called()
 
     def test_missing_validator_key_refused_on_preserve(self):
         self.lab.genesis = False
-        self.mocks["exists"].return_value = False
+        self.tool.read_keys.side_effect = [KEY_FILE, None]
         with pytest.raises(RuntimeError, match="would change the"):
             LabRunner(self.lab, self.workspace).run()
+        self.tool.create_keys.assert_not_called()
+
+    def test_missing_keys_created_on_genesis(self):
+        self.lab.genesis = True
+        self.tool.read_keys.side_effect = [None, None, KEY_FILE, None, KEY_FILE]
+        LabRunner(self.lab, self.workspace).run()
+        self.tool.create_keys.assert_has_calls(
+            [
+                call("keystore/vl/key.json"),
+                call("keystore/vnode1/key.json"),
+                call("keystore/vnode2/key.json"),
+            ]
+        )
+        self.tool.create_token.assert_called_once_with(
+            "keystore/vl/key.json", key_type="ed25519", out="keystore/vl/token.txt"
+        )
+        self.tool.set_domain.assert_any_call(
+            "keystore/vnode1/key.json",
+            "xrpl.vnode1.transia.co",
+            out="keystore/vnode1/token.txt",
+        )
+        written = {c.args[0] for c in self.tool.write_text.call_args_list}
+        assert written == {
+            "keystore/vl/manifest.txt",
+            "keystore/vnode1/attestation.txt",
+            "keystore/vnode1/manifest.txt",
+            "keystore/vnode2/attestation.txt",
+            "keystore/vnode2/manifest.txt",
+        }
+
+    def test_publisher_key_from_another_tool_is_refused(self):
+        self.tool.read_keys.return_value = {"publicKey": "EDPUBKEY"}
+        with pytest.raises(RuntimeError, match="migrate-keys"):
+            LabRunner(self.lab, self.workspace).run()
+
+    def test_signed_list_carries_every_validator(self):
+        LabRunner(self.lab, self.workspace).run()
+        entries = self.tool.publish_list.call_args.args[0]
+        assert entries == [
+            {"validation_public_key": "VALKEYHEX", "manifest": "manifest"},
+            {"validation_public_key": "VALKEYHEX", "manifest": "manifest"},
+        ]
 
 
 class TestExplorerTarget:
@@ -1260,7 +1281,8 @@ class TestNetworkBinaryStaging:
             ]
         )
         lab = build_lab_config(args)
-        LabRunner(lab, Workspace(base=str(tmp_path / "ws"))).run()
+        with patch("xrpld_lab.workflows.KeyTool", FakeKeyTool):
+            LabRunner(lab, Workspace(base=str(tmp_path / "ws"))).run()
         return tmp_path / "ws" / "develop-cluster"
 
     def test_binary_lands_in_every_node_dir(self, tmp_path):

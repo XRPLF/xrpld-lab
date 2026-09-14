@@ -10,13 +10,12 @@ from __future__ import annotations
 import json
 import os
 import shutil
-from typing import List
+from dataclasses import dataclass
+from typing import Dict, List
 
 import requests
 
-from xrpld_publisher.publisher import PublisherClient
-from xrpld_publisher.validator import ValidatorClient
-
+from xrpld_lab.keytool import KeyTool
 from xrpld_lab.models import (
     BuildType,
     DeployMode,
@@ -40,6 +39,23 @@ from xrpld_lab.amendments import (
 )
 from xrpld_lab.ansible_builder import AnsibleBuilder
 from xrpld_lab.utils import write_file, save_config, write_executable
+
+
+VL_KEYFILE = "keystore/vl/key.json"
+VL_TOKEN = "keystore/vl/token.txt"
+VL_MANIFEST = "keystore/vl/manifest.txt"
+
+
+@dataclass
+class ValidatorIdentity:
+    """What one validator's keystore contributes: its public key in base58 for
+    [validators] and in hex for the signed list, its [validator_token] base64 and
+    its manifest base64."""
+
+    public_key: str
+    public_key_hex: str
+    token: str
+    manifest: str
 
 
 def explorer_target(num_peers: int, port_offset: int = 0) -> tuple[str, int]:
@@ -178,6 +194,85 @@ class LabRunner:
             return self.lab.genesis
         return not os.path.isdir(os.path.join(cluster_path, "keystore"))
 
+    # -- keystore ---------------------------------------------------------
+
+    def _key_tool(self, cluster_dir: str) -> KeyTool:
+        source = self.lab.build_source
+        return KeyTool(cluster_dir, binary_path=source.binary_path, image=source.image)
+
+    @staticmethod
+    def _publisher_key(tool: KeyTool, genesis: bool) -> str:
+        """The publisher's master key as hex for [validator_list_keys], creating
+        keystore/vl (key, ed25519 token, manifest) when the cluster has none."""
+        keys = tool.read_keys(VL_KEYFILE)
+        if keys is None:
+            # Fresh VL keys change the network identity — never mint them
+            # silently for a network being preserved.
+            if not genesis:
+                raise RuntimeError(
+                    "non-genesis deploy but no VL publisher keys in this "
+                    "workspace — run from the workspace that created the "
+                    "network (or restore its keystore/)"
+                )
+            tool.create_keys(VL_KEYFILE)
+            tool.create_token(VL_KEYFILE, key_type="ed25519", out=VL_TOKEN)
+            tool.write_text(VL_MANIFEST, tool.show_manifest(VL_KEYFILE) + "\n")
+        elif "key_type" not in keys:
+            raise RuntimeError(
+                f"{VL_KEYFILE} is not a validator-keys key file: run "
+                "`xrpld-publisher migrate-keys` on it, or redeploy as genesis"
+            )
+        return tool.public_key_hex(VL_KEYFILE)
+
+    def _validator_identities(
+        self, tool: KeyTool, protocol_name: str, genesis: bool
+    ) -> List[ValidatorIdentity]:
+        return [
+            self._validator_identity(
+                tool, f"vnode{i}", f"{protocol_name}.vnode{i}.transia.co", genesis
+            )
+            for i in range(1, self.lab.num_validators + 1)
+        ]
+
+    @staticmethod
+    def _validator_identity(
+        tool: KeyTool, node_name: str, domain: str, genesis: bool
+    ) -> ValidatorIdentity:
+        """One validator's keystore entry, created (key, domain token, attestation,
+        manifest) when missing."""
+        keystore = f"keystore/{node_name}"
+        keyfile = f"{keystore}/key.json"
+        if tool.read_keys(keyfile) is None:
+            if not genesis:
+                raise RuntimeError(
+                    f"non-genesis deploy but {keyfile} is missing — "
+                    "a regenerated validator key would change the "
+                    "network identity"
+                )
+            tool.create_keys(keyfile)
+            tool.set_domain(keyfile, domain, out=f"{keystore}/token.txt")
+            attestation = tool.attest_domain(keyfile)
+            tool.write_text(f"{keystore}/attestation.txt", attestation + "\n")
+            manifest = tool.show_manifest(keyfile)
+            tool.write_text(f"{keystore}/manifest.txt", manifest + "\n")
+        return ValidatorIdentity(
+            public_key=tool.read_keys(keyfile)["public_key"],
+            public_key_hex=tool.public_key_hex(keyfile),
+            token=tool.read_token(f"{keystore}/token.txt"),
+            manifest=tool.read_manifest(f"{keystore}/manifest.txt"),
+        )
+
+    @staticmethod
+    def _list_entries(identities: List[ValidatorIdentity]) -> List[Dict[str, str]]:
+        """The validators of the unsigned list the publisher signs."""
+        return [
+            {
+                "validation_public_key": identity.public_key_hex,
+                "manifest": identity.manifest,
+            }
+            for identity in identities
+        ]
+
     def _stage_binary(self, source, dest: str) -> None:
         """Copy the local binary, or download it from the build server in binary mode.
 
@@ -315,7 +410,7 @@ class LabRunner:
         6. Parse amendments, write genesis for each node
         7. Create Dockerfiles and copy entrypoints
         8. Build docker-compose with all services
-        9. Sign UNL and write VL artifacts
+        9. Sign the validator list and write VL artifacts
         10. Generate start/stop scripts
         """
         lab = self.lab
@@ -338,62 +433,21 @@ class LabRunner:
         self._stage_binary(source, staged_binary)
         use_binary = source.build_type == BuildType.BINARY
 
-        # 2. Create VL keys
-        original_dir = os.getcwd()
-        os.chdir(cluster_dir)
-        try:
-            publisher = PublisherClient()
-            vl_keys = publisher.get_keys()
-            if not vl_keys:
-                # Fresh VL keys change the network identity — never mint them
-                # silently for a network being preserved.
-                if not genesis:
-                    raise RuntimeError(
-                        "non-genesis deploy but no VL publisher keys in this "
-                        "workspace — run from the workspace that created the "
-                        "network (or restore its keystore/)"
-                    )
-                publisher.create_keys()
-                vl_keys = publisher.get_keys()
+        # 2-3. Publisher and validator keys
+        tool = self._key_tool(cluster_dir)
+        vl_pub_key = self._publisher_key(tool, genesis)
+        identities = self._validator_identities(tool, protocol_name, genesis)
+        validators = [identity.public_key for identity in identities]
+        tokens = [identity.token for identity in identities]
+        ips_fixed: List[str] = []
+        use_ansible = lab.ansible is not None
 
-            vl_pub_key = vl_keys["publicKey"]
-
-            # 3. Create validator keys
-            manifests: List[str] = []
-            validators: List[str] = []
-            tokens: List[str] = []
-            ips_fixed: List[str] = []
-            use_ansible = lab.ansible is not None
-
-            for i in range(1, lab.num_validators + 1):
-                node_name = f"vnode{i}"
-                vc = ValidatorClient(node_name)
-                key_path = f"keystore/{node_name}/key.json"
-                if not os.path.exists(key_path):
-                    if not genesis:
-                        raise RuntimeError(
-                            f"non-genesis deploy but {key_path} is missing — "
-                            "a regenerated validator key would change the "
-                            "network identity"
-                        )
-                    vc.create_keys()
-                    vc.set_domain(f"{protocol_name}.{node_name}.transia.co")
-                    vc.create_token()
-                keys = vc.get_keys()
-                token = vc.read_token()
-                manifest = vc.read_manifest()
-                manifests.append(manifest)
-                validators.append(keys["public_key"])
-                tokens.append(token)
-
-                ports = PortSet.for_node(i, NodeRole.VALIDATOR)
-                if use_ansible and i <= len(lab.ansible.vips):
-                    ips_fixed.append(f"{lab.ansible.vips[i - 1]} {ports.peer}")
-                else:
-                    ips_fixed.append(f"vnode{i} {ports.peer}")
-
-        finally:
-            os.chdir(original_dir)
+        for i in range(1, lab.num_validators + 1):
+            ports = PortSet.for_node(i, NodeRole.VALIDATOR)
+            if use_ansible and i <= len(lab.ansible.vips):
+                ips_fixed.append(f"{lab.ansible.vips[i - 1]} {ports.peer}")
+            else:
+                ips_fixed.append(f"vnode{i} {ports.peer}")
 
         # 4-7. Create nodes, configs, genesis, dockerfiles
         compose = ComposeBuilder(f"{name}-network")
@@ -577,18 +631,10 @@ class LabRunner:
         compose.add_explorer_service(ws_port=ws_port, standalone=False)
         compose.write(os.path.join(cluster_dir, "docker-compose.yml"))
 
-        # 9. Sign UNL and write VL artifacts
+        # 9. Sign the validator list and write VL artifacts
         vl_dir = os.path.join(cluster_dir, "vl")
         os.makedirs(vl_dir, exist_ok=True)
-
-        original_dir = os.getcwd()
-        os.chdir(cluster_dir)
-        try:
-            for manifest in manifests:
-                publisher.add_validator(manifest)
-            publisher.sign_unl(os.path.join(vl_dir, "vl.json"))
-        finally:
-            os.chdir(original_dir)
+        tool.publish_list(self._list_entries(identities))
 
         # Copy nginx dockerfile for VL
         nginx_src = os.path.join(
@@ -692,7 +738,7 @@ class LabRunner:
         6. Parse amendments, write genesis for each node
         7. Build docker-compose for Docker-only services (VL + Explorer)
         8. Generate native start/stop scripts
-        9. Sign UNL and write VL artifacts
+        9. Sign the validator list and write VL artifacts
         """
         lab = self.lab
         spec = self.spec
@@ -715,43 +761,17 @@ class LabRunner:
         shutil.copy2(binary_src, binary_dest)
         os.chmod(binary_dest, 0o755)
 
-        # 2-3. Create VL + validator keys
-        original_dir = os.getcwd()
-        os.chdir(cluster_dir)
-        try:
-            publisher = PublisherClient()
-            vl_keys = publisher.get_keys()
-            if not vl_keys:
-                publisher.create_keys()
-                vl_keys = publisher.get_keys()
-
-            vl_pub_key = vl_keys["publicKey"]
-
-            manifests: List[str] = []
-            validators: List[str] = []
-            tokens: List[str] = []
-            ips_fixed: List[str] = []
-
-            for i in range(1, lab.num_validators + 1):
-                node_name = f"vnode{i}"
-                vc = ValidatorClient(node_name)
-                key_path = f"keystore/{node_name}/key.json"
-                if not os.path.exists(key_path):
-                    vc.create_keys()
-                    vc.set_domain(f"{protocol_name}.{node_name}.transia.co")
-                    vc.create_token()
-                keys = vc.get_keys()
-                token = vc.read_token()
-                manifest = vc.read_manifest()
-                manifests.append(manifest)
-                validators.append(keys["public_key"])
-                tokens.append(token)
-
-                ports = PortSet.for_node(i, NodeRole.VALIDATOR, lab.port_offset)
-                ips_fixed.append(f"127.0.0.1 {ports.peer}")
-
-        finally:
-            os.chdir(original_dir)
+        # 2-3. Publisher and validator keys; a local network always creates what
+        # its keystore lacks.
+        tool = self._key_tool(cluster_dir)
+        vl_pub_key = self._publisher_key(tool, genesis=True)
+        identities = self._validator_identities(tool, protocol_name, genesis=True)
+        validators = [identity.public_key for identity in identities]
+        tokens = [identity.token for identity in identities]
+        ips_fixed = [
+            f"127.0.0.1 {PortSet.for_node(i, NodeRole.VALIDATOR, lab.port_offset).peer}"
+            for i in range(1, lab.num_validators + 1)
+        ]
 
         # 4-6. Create nodes, configs, genesis
         for i in range(1, lab.num_validators + 1):
@@ -859,18 +879,10 @@ class LabRunner:
             ScriptBuilder.local_network_stop(name, lab.num_validators, lab.num_peers),
         )
 
-        # 9. Sign UNL and write VL artifacts
+        # 9. Sign the validator list and write VL artifacts
         vl_dir = os.path.join(cluster_dir, "vl")
         os.makedirs(vl_dir, exist_ok=True)
-
-        original_dir = os.getcwd()
-        os.chdir(cluster_dir)
-        try:
-            for manifest in manifests:
-                publisher.add_validator(manifest)
-            publisher.sign_unl(os.path.join(vl_dir, "vl.json"))
-        finally:
-            os.chdir(original_dir)
+        tool.publish_list(self._list_entries(identities))
 
         # Copy nginx dockerfile for VL
         nginx_src = os.path.join(

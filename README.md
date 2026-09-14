@@ -19,6 +19,17 @@ Four deployment modes:
 pip install xrpld-lab
 ```
 
+Network and local clusters need rippled's `validator-keys` tool for key generation, tokens, manifests and list signing. xrpld-lab looks for it, in order, at `$VALIDATOR_KEYS_BIN`, beside the xrpld binary given by `--binary_path`, on `PATH`, and at `/opt/xrpld/bin/validator-keys` inside the cluster's docker image. Build it with rippled (`-Dvalidator_keys=ON`) or point `VALIDATOR_KEYS_BIN` at a built copy.
+
+## Keystore
+
+Each cluster's identity lives under `<workspace>/<cluster>/keystore/`, written by `validator-keys`:
+
+- `vl/key.json`, `vl/token.txt`, `vl/manifest.txt` -- the publisher's master key, its ed25519 signing token and manifest. The master key, as hex, is every node's `[validator_list_keys]` entry.
+- `vnodeN/key.json`, `vnodeN/token.txt`, `vnodeN/manifest.txt`, `vnodeN/attestation.txt` -- each validator's master key, its `[validator_token]`, its manifest and the domain attestation for `xrpl.vnodeN.transia.co`.
+
+Every deploy signs `vl/unsigned.json` into `vl/vl.json` with the publisher token and verifies the result. A `vl/key.json` from the retired `xrpld-publisher` package (no `key_type` field) is refused; run `xrpld-publisher migrate-keys` on it or redeploy with `--genesis True`.
+
 ## Quick start
 
 ```bash
@@ -266,6 +277,7 @@ xrpld_lab/
   amendments.py       # C++ feature macro parsing + genesis updates
   source_resolver.py  # GitHub fetch, binary download, feature/config resolution
   node_factory.py     # Creates NodeConfig for validator/peer/standalone
+  keytool.py          # KeyTool: runs validator-keys for keys, tokens, signed lists
   compose_builder.py  # docker-compose.yml as structured dict
   script_builder.py   # Dockerfiles + start/stop shell scripts
   workflows.py        # LabRunner: orchestrates standalone/network/local/ansible
@@ -284,6 +296,8 @@ git clone https://github.com/XRPLF/xrpld-lab
 cd xrpld-lab
 poetry install
 poetry run pytest tests
+# also run the real validator-keys tool end to end
+VALIDATOR_KEYS_BIN=/path/to/validator-keys poetry run pytest tests/integration
 ```
 
 ## Current versions
